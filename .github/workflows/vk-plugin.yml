@@ -1,0 +1,59 @@
+name: VK plugin
+
+on:
+  push:
+    paths:
+      - "plugins/vk/**"
+      - "tests/test_vk_*.py"
+      - "scripts/vk_*.py"
+      - "pyproject.toml"
+      - ".github/workflows/vk-plugin.yml"
+  pull_request:
+    paths:
+      - "plugins/vk/**"
+      - "tests/test_vk_*.py"
+      - "scripts/vk_*.py"
+      - "pyproject.toml"
+      - ".github/workflows/vk-plugin.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Compile VK plugin and tests
+        run: python -m compileall -q plugins/vk tests scripts
+      - name: Run MAX and VK regression suite
+        run: python -m pytest -q
+
+  loader:
+    name: Hermes loader smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run standalone loader smoke when Hermes checkout is available
+        run: |
+          if [ -n "${HERMES_ROOT:-}" ] && [ -d "$HERMES_ROOT" ]; then
+            python scripts/vk_loader_smoke.py --hermes-root "$HERMES_ROOT"
+          else
+            echo "HERMES_ROOT is not configured; local plugin contract tests remain authoritative."
+          fi
