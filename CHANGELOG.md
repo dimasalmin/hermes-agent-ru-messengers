@@ -6,7 +6,7 @@
 - Added deterministic contract coverage for API clients, callbacks, media,
   allowlists, durable state, and standalone VK export.
 - Local verification: 133 tests passed; live MAX/VK acceptance remains open.
-+- Added public installation, security, contribution, and CI documentation.
+- Added public installation, security, contribution, and CI documentation.
 
 ## Unreleased
 
