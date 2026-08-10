@@ -1,4 +1,37 @@
-# Hermes Agent MAX and VK plugins
+# Hermes Agent — плагины MAX и VK / MAX and VK plugins
+
+[Русская версия](#русская-версия) · [English version](#english-version)
+
+## Русская версия
+
+Неофициальные внешние плагины платформы для [Hermes Agent](https://github.com/NousResearch/hermes-agent):
+
+- MAX Bot API v2 через HTTPS Webhook или Long Polling для разработки;
+- VK Community Long Poll с прямым HTTP-транспортом.
+
+Код находится вне ядра Hermes Agent, поэтому Hermes можно обновлять и откатывать независимо от этих интеграций.
+
+Проект экспериментальный. Локальная проверка прошла: 133 детерминированных теста и loader checks. При этом рабочая проверка MAX/VK всё ещё требует одноразовых учётных данных и реального тестового пользователя или сообщества.
+
+Проект не гарантирует доступность MAX/VK, прохождение whitelist-политик или сетевую доступность у конкретного оператора. Это нужно отдельно проверять для региона, оператора, устройства и режима сбоя.
+
+Установка и настройка:
+
+- [настройка MAX](docs/ru/max-setup.md);
+- [настройка VK](docs/ru/vk-setup.md);
+- [интерактивные сценарии MAX](docs/ru/max-interactive.md).
+
+Для разработки:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+python -m compileall -q plugins tests scripts
+```
+
+Никогда не публикуйте токены, cookies, базы данных, логи или production-конфигурацию. Включайте плагины только после проверки их поведения и allowlist-настроек.
+
+## English version
 
 Unofficial external platform plugins for [Hermes Agent](https://github.com/NousResearch/hermes-agent):
 
