@@ -5,6 +5,8 @@ version: 0.3.0
 description: >
   Hermes Agent adapter for VK community bots using Community Long Poll,
   native callbacks and bounded media transport.
+  Русский: адаптер Hermes Agent для сообществ VK с Community Long Poll,
+  нативными callback-событиями и ограниченным транспортом медиа.
 author: hermes-agent-ru-messengers contributors
 license: MIT
 homepage: https://github.com/dimasalmin/hermes-agent-ru-messengers
