@@ -4,8 +4,8 @@ from plugins.vk.formatting import markdown_to_vk
 
 
 def test_markdown_to_vk_preserves_plain_text_and_native_spans():
-    text, format_data = markdown_to_vk("**РџСЂРёРІРµС‚**, *РјРёСЂ* [СЃСЃС‹Р»РєР°](https://example.com)")
-    assert text == "РџСЂРёРІРµС‚, РјРёСЂ СЃСЃС‹Р»РєР°"
+    text, format_data = markdown_to_vk("**Привет**, *мир* [ссылка](https://example.com)")
+    assert text == "Привет, мир ссылка"
     assert format_data == {
         "version": 1,
         "items": [
@@ -17,6 +17,6 @@ def test_markdown_to_vk_preserves_plain_text_and_native_spans():
 
 
 def test_markdown_to_vk_handles_emoji_utf16_offsets_and_unmatched_markers():
-    text, format_data = markdown_to_vk("рџ”Ґ **ok** *literal")
-    assert text == "рџ”Ґ ok *literal"
+    text, format_data = markdown_to_vk("🔥 **ok** *literal")
+    assert text == "🔥 ok *literal"
     assert format_data == {"version": 1, "items": [{"type": "bold", "offset": 3, "length": 2}]}
