@@ -1,16 +1,21 @@
-# MAX Hermes plugin
+# Плагин MAX для Hermes Agent
 
-This directory is intentionally self-contained because Hermes loads external
-plugins as `hermes_plugins.<slug>`. Keep internal imports relative and do not
-depend on sibling packages from this repository.
+Каталог самодостаточен: Hermes загружает внешний plugin как отдельный
+`hermes_plugins.<slug>`. Устанавливайте его штатной командой:
 
-The plugin targets MAX Bot API v2 at `platform-api2.max.ru` and uses the public
-Hermes platform adapter contract. It currently exposes the text MVP, development
-Long Polling, Webhook receiver/queue primitives, allowlist policy, API errors,
-and TLS verification.
+```bash
+hermes plugins install dimasalmin/hermes-agent-ru-messengers/plugins/max --enable
+```
 
-Install this directory as `~/.hermes/plugins/max/` with the lowercase
-`plugin.yaml` manifest. Do not install it inside the Hermes source tree.
+Не помещайте plugin в исходное дерево Hermes. Плагин работает с MAX Bot API v2,
+поддерживает Long Polling для разработки, заготовки Webhook-приёмника, allowlist
+и проверку TLS. Токен MAX храните в защищённом prompt Hermes или локальном
+`.env`, не в истории чата.
 
-See the Russian setup guide at `../../docs/ru/max-setup.md` and the public
-English setup guide at `../../docs/en/max-setup.md`.
+Полная русская инструкция: [настройка MAX](https://github.com/dimasalmin/hermes-agent-ru-messengers/blob/main/docs/ru/max-setup.md).
+
+## English summary
+
+Self-contained MAX Bot API v2 platform plugin. Install the `plugins/max`
+subdirectory with Hermes, keep it outside Hermes core, protect the bot token,
+and follow the [English setup guide](https://github.com/dimasalmin/hermes-agent-ru-messengers/blob/main/docs/en/max-setup.md).
