@@ -36,7 +36,7 @@ def split_message(text: str, max_len: int) -> List[str]:
             # We closed a fence; nothing to carry.
             pass
         elif in_code:
-            # Still inside the same fence вЂ” close it for this chunk, reopen next.
+            # Still inside the same fence — close it for this chunk, reopen next.
             chunk = chunk + "\n" + FENCE
         elif fence_count % 2 == 1:
             # We opened a fence and haven't closed it; close + reopen.
