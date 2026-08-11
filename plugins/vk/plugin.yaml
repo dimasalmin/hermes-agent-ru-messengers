@@ -13,14 +13,14 @@ homepage: https://github.com/dimasalmin/hermes-agent-ru-messengers
 
 requires_env:
   - name: VK_GROUP_TOKEN
-    description: "Community access token"
-    prompt: "VK Group Token"
+    description: "Ключ доступа сообщества VK; community access token"
+    prompt: "Ключ доступа сообщества VK"
     password: true
     category: messaging
-    url: "https://dev.vk.com/en/api/community-messages/getting-started"
+    url: "https://github.com/dimasalmin/hermes-agent-ru-messengers/blob/main/docs/ru/vk-setup.md"
   - name: VK_GROUP_ID
-    description: "Numeric VK group/community ID"
-    prompt: "VK Group ID"
+    description: "Числовой ID сообщества VK; numeric group/community ID"
+    prompt: "Числовой ID сообщества VK"
     category: messaging
 
 optional_env:
