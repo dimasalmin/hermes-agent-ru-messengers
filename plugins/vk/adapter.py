@@ -515,22 +515,138 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
             source=source,
             raw_message=event.raw_event,
             message_id=event.message_id,
-            reply_to_message_id=event.reply_to…1648 tokens truncated…°СЏ РєРЅРѕРїРєР° РІС‹Р±РѕСЂР° РјРѕРґРµР»Рё.")
+            reply_to_message_id=event.reply_to_message_id,
+            reply_to_text=event.reply_to_text,
+            media_urls=media_urls,
+            media_types=media_types,
+            metadata={
+                "vk_user_id": user_id,
+                "vk_peer_id": chat_id,
+                "vk_group_id": self._group_id,
+                "vk_payload": event.payload,
+            },
+        )
+        await self.handle_message(normalized)
+
+    def _can_dm(self, user_id: str) -> bool:
+        if self._dm_policy == "disabled":
+            return False
+        if self._dm_policy == "open":
+            return True
+        if self._dm_policy == "pairing":
+            return bool(self._state and self._state.is_paired(user_id)) or self._access.can_dm(user_id)
+        return self._access.can_dm(user_id)
+
+    def _can_group(self, user_id: str, chat_id: str, *, mentioned: bool) -> bool:
+        if self._group_policy == "disabled":
+            return False
+        if self._group_policy == "open":
+            return True
+        return self._access.can_group(user_id, chat_id, mentioned=mentioned)
+
+    async def _try_pairing(self, user_id: str, peer_id: str, text: str) -> bool:
+        parts = text.strip().split(maxsplit=1)
+        if len(parts) != 2 or parts[0].lower() not in {"/pair", "/pairing"}:
+            return False
+        if self._state is None or not self._state.approve_pairing(user_id, parts[1].strip()):
+            return False
+        await self.send(
+            peer_id,
+            "Подключение подтверждено. Теперь можно отправлять запросы Hermes Agent.",
+        )
+        return True
+
+    def _is_mentioned(self, text: str) -> bool:
+        lowered = text.lower()
+        if self._group_screen_name and f"@{self._group_screen_name.lower()}" in lowered:
+            return True
+        return bool(self._group_id and f"[club{self._group_id}|" in lowered)
+
+    async def _dispatch_callback(self, callback: VkCallback) -> None:
+        if self._client is None:
+            return
+        is_group = _is_chat_peer(callback.peer_id)
+        authorized = (
+            self._can_group(callback.user_id, str(callback.peer_id), mentioned=False)
+            if is_group
+            else self._can_dm(callback.user_id)
+        )
+        if not authorized:
+            await self._answer_callback(callback, "Нет доступа к этой кнопке.")
+            return
+        entry = self._callbacks.consume_for_context(
+            str(callback.payload), user_id=callback.user_id, peer_id=str(callback.peer_id)
+        )
+        if entry is None:
+            await self._answer_callback(callback, "Кнопка устарела или уже использована.")
+            return
+        kind, action, session_key = entry["kind"], entry["action"], entry["session_key"]
+        try:
+            if kind == "approval":
+                from tools.approval import resolve_gateway_approval
+
+                count = resolve_gateway_approval(session_key, action)
+                labels = {
+                    "once": "Разрешено один раз",
+                    "session": "Разрешено на сессию",
+                    "always": "Разрешено всегда",
+                    "deny": "Запрещено",
+                }
+                await self._answer_callback(callback, labels.get(action, "Запрос обработан") if count else "Запрос уже завершён")
+                return
+            if kind == "slash":
+                from tools import slash_confirm
+
+                choice, confirm_id = action.split(":", 1)
+                result = await slash_confirm.resolve(session_key, confirm_id, choice)
+                await self._answer_callback(callback, {"once": "Подтверждено", "always": "Подтверждено всегда", "cancel": "Отменено"}.get(choice, "Обработано"))
+                if result:
+                    await self.send(str(callback.peer_id), str(result))
+                return
+            if kind == "clarify":
+                clarify_id, choice = action.split(":", 1)
+                if choice == "other":
+                    from tools.clarify_gateway import mark_awaiting_text
+
+                    ok = mark_awaiting_text(clarify_id)
+                    await self._answer_callback(callback, "Введите свой вариант следующим сообщением." if ok else "Запрос уже завершён.")
+                    return
+                from tools.clarify_gateway import _entries as clarify_entries, resolve_gateway_clarify
+
+                resolved_text = f"choice {int(choice) + 1}"
+                clarify_entry = clarify_entries.get(clarify_id)
+                if clarify_entry and clarify_entry.choices and 0 <= int(choice) < len(clarify_entry.choices):
+                    resolved_text = str(clarify_entry.choices[int(choice)])
+                ok = resolve_gateway_clarify(clarify_id, resolved_text)
+                await self._answer_callback(callback, f"Выбрано: {resolved_text}" if ok else "Запрос уже завершён.")
+                return
+            if kind == "model":
+                await self._dispatch_model_callback(callback, action)
+                return
+            await self._answer_callback(callback, "Неизвестная кнопка.")
+        except Exception:
+            logger.exception("VK callback resolution failed")
+            await self._answer_callback(callback, "Не удалось обработать кнопку.")
+
+    async def _dispatch_model_callback(self, callback: VkCallback, action: str) -> None:
+        parts = str(action).split(":", 2)
+        if len(parts) < 2:
+            await self._answer_callback(callback, "Некорректная кнопка выбора модели.")
             return
         picker_id, operation = parts[0], parts[1]
         state = self._model_pickers.get(picker_id)
         if state is None:
-            await self._answer_callback(callback, "Р’С‹Р±РѕСЂ РјРѕРґРµР»Рё СѓСЃС‚Р°СЂРµР». РћС‚РєСЂРѕР№С‚Рµ /model Р·Р°РЅРѕРІРѕ.")
+            await self._answer_callback(callback, "Выбор модели устарел. Откройте /model заново.")
             return
         if operation == "cancel":
             self._model_pickers.pop(picker_id, None)
-            await self._answer_callback(callback, "Р’С‹Р±РѕСЂ РјРѕРґРµР»Рё РѕС‚РјРµРЅРµРЅ.")
+            await self._answer_callback(callback, "Выбор модели отменен.")
             return
         if operation == "provider" and len(parts) == 3:
             provider = parts[2]
             models = list(state.get("models", {}).get(provider, []))
             if not models:
-                await self._answer_callback(callback, "РЈ РїСЂРѕРІР°Р№РґРµСЂР° РЅРµС‚ РґРѕСЃС‚СѓРїРЅС‹С… РјРѕРґРµР»РµР№.")
+                await self._answer_callback(callback, "У провайдера нет доступных моделей.")
                 return
             rows = []
             for index, model in enumerate(models[:50]):
@@ -543,8 +659,8 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 )
                 rows.append([{"label": str(model).rsplit("/", 1)[-1][:40], "payload": payload, "color": "primary"}])
             state["selected_provider"] = provider
-            await self._answer_callback(callback, f"РџСЂРѕРІР°Р№РґРµСЂ: {provider}. Р’С‹Р±РµСЂРёС‚Рµ РјРѕРґРµР»СЊ.")
-            await self._send_interactive(str(callback.peer_id), f"РџСЂРѕРІР°Р№РґРµСЂ: {provider}\n\nР’С‹Р±РµСЂРёС‚Рµ РјРѕРґРµР»СЊ:", rows)
+            await self._answer_callback(callback, f"Провайдер: {provider}. Выберите модель.")
+            await self._send_interactive(str(callback.peer_id), f"Провайдер: {provider}\n\nВыберите модель:", rows)
             return
         if operation == "model" and len(parts) == 3:
             try:
@@ -552,20 +668,20 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 models = list(state.get("models", {}).get(str(state.get("selected_provider")), []))
                 model_id = str(models[index])
             except (ValueError, IndexError, TypeError):
-                await self._answer_callback(callback, "РњРѕРґРµР»СЊ РЅРµ РЅР°Р№РґРµРЅР°.")
+                await self._answer_callback(callback, "Модель не найдена.")
                 return
             callback_fn = state.get("on_model_selected")
             if not callable(callback_fn):
                 self._model_pickers.pop(picker_id, None)
-                await self._answer_callback(callback, "РћР±СЂР°Р±РѕС‚С‡РёРє РІС‹Р±РѕСЂР° РјРѕРґРµР»Рё РЅРµРґРѕСЃС‚СѓРїРµРЅ.")
+                await self._answer_callback(callback, "Обработчик выбора модели недоступен.")
                 return
             result = callback_fn(str(callback.peer_id), model_id, str(state.get("selected_provider") or ""))
             if inspect.isawaitable(result):
                 result = await result
             self._model_pickers.pop(picker_id, None)
-            await self._answer_callback(callback, str(result or f"РњРѕРґРµР»СЊ РїРµСЂРµРєР»СЋС‡РµРЅР°: {model_id}"))
+            await self._answer_callback(callback, str(result or f"Модель переключена: {model_id}"))
             return
-        await self._answer_callback(callback, "РќРµРёР·РІРµСЃС‚РЅРѕРµ РґРµР№СЃС‚РІРёРµ РІС‹Р±РѕСЂР° РјРѕРґРµР»Рё.")
+        await self._answer_callback(callback, "Неизвестное действие выбора модели.")
 
     async def _answer_callback(self, callback: VkCallback, text: str) -> None:
         if self._client is None:
@@ -610,7 +726,7 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return _send_result_from_ids(ids)
         except VkApiError as exc:
             if media_paths and not ids:
-                fallback = text or "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РІР»РѕР¶РµРЅРёРµ."
+                fallback = text or "Не удалось отправить вложение."
                 return await self.send(chat_id, fallback, reply_to=reply_to, metadata=metadata)
             return SendResult(
                 success=False,
@@ -620,7 +736,7 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         except (OSError, ValueError, RuntimeError) as exc:
             if media_paths and not ids:
-                fallback = text or "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РІР»РѕР¶РµРЅРёРµ."
+                fallback = text or "Не удалось отправить вложение."
                 return await self.send(chat_id, fallback, reply_to=reply_to, metadata=metadata)
             return SendResult(success=False, error=str(exc))
 
@@ -727,11 +843,11 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         context = self._interactive_context(chat_id, metadata)
         if context is None or not choices:
-            return await self.send(chat_id, f"вќ“ {question}", metadata=metadata)
+            return await self.send(chat_id, f"❓ {question}", metadata=metadata)
         peer_id, user_id = context
         rows = [[{"label": str(choice)[:40], "payload": self._callbacks.issue("clarify", f"{clarify_id}:{index}", user_id=user_id, peer_id=peer_id, session_key=session_key), "color": "primary"}] for index, choice in enumerate(choices[:50])]
-        rows.append([{"label": "Р”СЂСѓРіРѕРµ", "payload": self._callbacks.issue("clarify", f"{clarify_id}:other", user_id=user_id, peer_id=peer_id, session_key=session_key), "color": "secondary"}])
-        return await self._send_interactive(chat_id, f"вќ“ {question}\n\n" + "\n".join(f"{i + 1}. {choice}" for i, choice in enumerate(choices[:50])), rows)
+        rows.append([{"label": "Другое", "payload": self._callbacks.issue("clarify", f"{clarify_id}:other", user_id=user_id, peer_id=peer_id, session_key=session_key), "color": "secondary"}])
+        return await self._send_interactive(chat_id, f"❓ {question}\n\n" + "\n".join(f"{i + 1}. {choice}" for i, choice in enumerate(choices[:50])), rows)
 
     async def send_exec_approval(self, chat_id: str, command: str, session_key: str, description: str = "dangerous command", metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True, smart_denied: bool = False) -> Any:
         del smart_denied
@@ -739,22 +855,22 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
         if context is None:
             return SendResult(success=False, error="VK native buttons require a known user context")
         peer_id, user_id = context
-        choices = [("once", "Р Р°Р·СЂРµС€РёС‚СЊ РѕРґРёРЅ СЂР°Р·")]
+        choices = [("once", "Разрешить один раз")]
         if allow_session:
-            choices.append(("session", "Р Р°Р·СЂРµС€РёС‚СЊ РЅР° СЃРµСЃСЃРёСЋ"))
+            choices.append(("session", "Разрешить на сессию"))
         if allow_permanent:
-            choices.append(("always", "Р Р°Р·СЂРµС€РёС‚СЊ РІСЃРµРіРґР°"))
-        choices.append(("deny", "Р—Р°РїСЂРµС‚РёС‚СЊ"))
+            choices.append(("always", "Разрешить всегда"))
+        choices.append(("deny", "Запретить"))
         rows = [[{"label": label, "payload": self._callbacks.issue("approval", action, user_id=user_id, peer_id=peer_id, session_key=session_key), "color": "positive" if action != "deny" else "negative"} for action, label in choices[index:index + 2]] for index in range(0, len(choices), 2)]
         preview = command[:3000] + ("..." if len(command) > 3000 else "")
-        return await self._send_interactive(chat_id, f"вљ  РўСЂРµР±СѓРµС‚СЃСЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РєРѕРјР°РЅРґС‹:\n\n```\n{preview}\n```\nРџСЂРёС‡РёРЅР°: {description}", rows)
+        return await self._send_interactive(chat_id, f"⚠ Требуется подтверждение команды:\n\n```\n{preview}\n```\nПричина: {description}", rows)
 
     async def send_slash_confirm(self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str, metadata: Optional[Dict[str, Any]] = None) -> Any:
         context = self._interactive_context(chat_id, metadata)
         if context is None:
             return SendResult(success=False, error="VK native buttons require a known user context")
         peer_id, user_id = context
-        choices = [("once", "РџРѕРґС‚РІРµСЂРґРёС‚СЊ РѕРґРёРЅ СЂР°Р·"), ("always", "РџРѕРґС‚РІРµСЂР¶РґР°С‚СЊ РІСЃРµРіРґР°"), ("cancel", "РћС‚РјРµРЅР°")]
+        choices = [("once", "Подтвердить один раз"), ("always", "Подтверждать всегда"), ("cancel", "Отмена")]
         rows = [[{"label": label, "payload": self._callbacks.issue("slash", f"{action}:{confirm_id}", user_id=user_id, peer_id=peer_id, session_key=session_key), "color": "negative" if action == "cancel" else "primary"}] for action, label in choices]
         return await self._send_interactive(chat_id, f"{title}\n\n{message}", rows)
 
@@ -773,7 +889,7 @@ class VkAdapter(BasePlatformAdapter):  # type: ignore[misc]
             self._model_pickers[picker_id]["models"][slug] = [str(item) for item in provider.get("models", [])]
             payload = self._callbacks.issue("model", f"{picker_id}:provider:{slug}", user_id=user_id, peer_id=peer_id, session_key=session_key)
             rows.append([{"label": str(provider.get("name") or slug)[:40], "payload": payload, "color": "primary"}])
-        return await self._send_interactive(chat_id, f"РўРµРєСѓС‰Р°СЏ РјРѕРґРµР»СЊ: {current_model}\nРџСЂРѕРІР°Р№РґРµСЂ: {current_provider}\n\nР’С‹Р±РµСЂРёС‚Рµ РїСЂРѕРІР°Р№РґРµСЂР°:", rows)
+        return await self._send_interactive(chat_id, f"Текущая модель: {current_model}\nПровайдер: {current_provider}\n\nВыберите провайдера:", rows)
 
 
 def _truthy(value: Any) -> bool:
