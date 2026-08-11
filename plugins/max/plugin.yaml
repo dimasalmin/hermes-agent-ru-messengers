@@ -3,11 +3,10 @@ label: MAX
 kind: platform
 version: 0.2.0
 description: >
-  External Hermes Agent adapter for MAX Bot API v2. Uses the documented
-  platform-api2.max.ru REST API, HTTPS Webhook or development Long Polling,
-  strict allowlist policy, and TLS verification.
   Русский: внешний адаптер Hermes Agent для MAX Bot API v2 с HTTPS Webhook,
   Long Polling для разработки, allowlist-политикой и проверкой TLS.
+  English: external Hermes Agent adapter for MAX Bot API v2 with HTTPS Webhook
+  or development Long Polling, strict allowlist policy, and TLS verification.
 author: Hermes Agent RU Messenger contributors
 license: MIT
 homepage: https://github.com/dimasalmin/hermes-agent-ru-messengers
