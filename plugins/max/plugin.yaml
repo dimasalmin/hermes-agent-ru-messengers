@@ -13,8 +13,8 @@ homepage: https://github.com/dimasalmin/hermes-agent-ru-messengers
 
 requires_env:
   - name: MAX_BOT_TOKEN
-    description: "Bot token created in MAX for Business"
-    prompt: "MAX Bot API token"
+    description: "Токен бота MAX for Business; bot token created in MAX for Business"
+    prompt: "Токен бота MAX"
     password: true
     category: messaging
     url: "https://business.max.ru/"
