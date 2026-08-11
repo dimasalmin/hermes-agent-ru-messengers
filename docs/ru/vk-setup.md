@@ -9,9 +9,11 @@
    добавьте права на фотографии и документы.
 5. Запишите числовой ID сообщества из URL `vk.com/club<ID>`.
 
-Официальные ссылки:
+В этой русской инструкции уже собраны необходимые действия для настройки.
+Отдельная англоязычная страница VK не требуется.
 
-- [Начало работы с Community Messages](https://dev.vk.com/en/api/community-messages/getting-started)
+Справочные методы API:
+
 - [messages.send](https://dev.vk.com/method/messages.send)
 - [messages.sendMessageEventAnswer](https://dev.vk.com/method/messages.sendMessageEventAnswer)
 - [photos.getMessagesUploadServer](https://dev.vk.com/method/photos.getMessagesUploadServer)
