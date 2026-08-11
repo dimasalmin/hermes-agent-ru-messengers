@@ -84,7 +84,7 @@ async def test_vk_pairing_command_approves_user_before_dispatch():
         }
     )
     assert adapter._state.is_paired("100000001") is True
-    assert sent and "РџРѕРґРєР»СЋС‡РµРЅРёРµ РїРѕРґС‚РІРµСЂР¶РґРµРЅРѕ" in sent[0][1]
+    assert sent and "Подключение подтверждено" in sent[0][1]
     assert events == []
 
     await adapter._dispatch_update(
@@ -134,10 +134,10 @@ async def test_vk_send_renders_markdown_as_format_data():
             return 12
 
     adapter._client = FakeClient()
-    result = await adapter.send("100000001", "**РџСЂРёРІРµС‚**")
+    result = await adapter.send("100000001", "**Привет**")
 
     assert result.success is True
-    assert calls[0][1] == "РџСЂРёРІРµС‚"
+    assert calls[0][1] == "Привет"
     assert calls[0][2]["format_data"]["items"][0]["type"] == "bold"
 
 
@@ -186,8 +186,8 @@ async def test_vk_send_keyboard_supports_chat_keyboard_actions():
     adapter._client = FakeClient()
     result = await adapter.send_keyboard(
         "100000001",
-        "Р’С‹Р±РµСЂРёС‚Рµ",
-        [[{"label": "Р”РѕРєСѓРјРµРЅС‚Р°С†РёСЏ", "action_type": "open_link", "link": "https://example.com"}]],
+        "Выберите",
+        [[{"label": "Документация", "action_type": "open_link", "link": "https://example.com"}]],
         inline=False,
     )
 
