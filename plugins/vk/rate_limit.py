@@ -40,7 +40,7 @@ def reconnect_delay(
 
 
 def is_vk_rate_limit(exc: BaseException) -> bool:
-    """Detect VK API throttle errors (codes 6, 9 вЂ” too many requests / flood)."""
+    """Detect VK API throttle errors (codes 6, 9 — too many requests / flood)."""
     code = getattr(exc, "code", None) or getattr(exc, "error_code", None)
     if code in {6, 9}:
         return True
