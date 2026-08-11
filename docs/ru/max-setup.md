@@ -17,7 +17,24 @@
 
 ## 2. Установка без изменения Hermes core
 
-Репозиторий плагина должен оставаться отдельным от Hermes:
+Рекомендуемый способ для Hermes Agent — установить подкаталог напрямую из
+GitHub. Корень этого репозитория содержит два плагина и не устанавливается как
+один plugin:
+
+```bash
+hermes plugins install dimasalmin/hermes-agent-ru-messengers/plugins/max --enable
+```
+
+После установки проверьте plugin и перезапустите gateway:
+
+```bash
+hermes plugins list --user
+hermes doctor
+hermes gateway restart
+```
+
+Для разработки из локального checkout репозиторий должен оставаться отдельным
+от Hermes:
 
 ```bash
 python -m pip install -e ".[dev]"
