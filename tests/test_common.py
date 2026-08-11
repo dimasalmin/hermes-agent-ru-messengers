@@ -1,4 +1,4 @@
-"""Tests for shared utilities вЂ” these run without Hermes core installed."""
+"""Tests for shared utilities — these run without Hermes core installed."""
 
 from __future__ import annotations
 
