@@ -91,7 +91,7 @@ async def with_backoff(
         attempt += 1
         try:
             return await fn()
-        except BaseException as exc:  # noqa: BLE001 вЂ” caller's is_rate_limit decides
+        except BaseException as exc:  # noqa: BLE001 — caller's is_rate_limit decides
             if not is_rate_limit(exc) or attempt >= max_attempts:
                 raise
             wait = extract_retry_after(exc)
