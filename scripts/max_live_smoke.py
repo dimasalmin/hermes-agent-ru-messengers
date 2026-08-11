@@ -89,7 +89,7 @@ def main() -> int:
     parser.add_argument("--send", action="store_true")
     parser.add_argument(
         "--message",
-        default="Hermes/MAX transport smoke: РѕС‚РІРµС‚СЊС‚Рµ РєРѕСЂРѕС‚РєРёРј С‚РµРєСЃС‚РѕРј РґР»СЏ РїСЂРѕРІРµСЂРєРё inbound.",
+        default="Hermes/MAX transport smoke: ответьте коротким текстом для проверки inbound.",
     )
     parser.add_argument("--poll-seconds", type=int, default=0)
     return asyncio.run(_run(parser.parse_args()))
