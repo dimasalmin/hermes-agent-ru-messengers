@@ -128,10 +128,10 @@ async def test_send_exec_approval_renders_max_inline_keyboard() -> None:
     assert "rm -rf /tmp/example" in text
     buttons = kwargs["attachments"][0]["payload"]["buttons"]
     assert [button["text"] for row in buttons for button in row] == [
-        "Р Р°Р·СЂРµС€РёС‚СЊ РѕРґРёРЅ СЂР°Р·",
-        "Р Р°Р·СЂРµС€РёС‚СЊ РЅР° СЃРµСЃСЃРёСЋ",
-        "Р Р°Р·СЂРµС€РёС‚СЊ РІСЃРµРіРґР°",
-        "Р—Р°РїСЂРµС‚РёС‚СЊ",
+        "Разрешить один раз",
+        "Разрешить на сессию",
+        "Разрешить всегда",
+        "Запретить",
     ]
     assert all(button["payload"].startswith("hmx:approval:") for row in buttons for button in row)
 
@@ -163,8 +163,8 @@ async def test_send_model_picker_renders_provider_buttons() -> None:
     assert "qwen/test" in text
     buttons = kwargs["attachments"][0]["payload"]["buttons"]
     assert [button["text"] for row in buttons for button in row] == [
-        "вњ“ Local model (1)",
-        "РћС‚РјРµРЅР°",
+        "✓ Local model (1)",
+        "Отмена",
     ]
     assert all(button["payload"].startswith("hmx:model:") for row in buttons for button in row)
 
@@ -177,7 +177,7 @@ async def test_model_picker_callbacks_navigate_and_switch_model(monkeypatch) -> 
 
     async def on_model_selected(chat_id, model_id, provider_slug):
         selected.append((chat_id, model_id, provider_slug))
-        return "РњРѕРґРµР»СЊ РїРµСЂРµРєР»СЋС‡РµРЅР°"
+        return "Модель переключена"
 
     await adapter.send_model_picker(
         "user-1",
@@ -228,7 +228,7 @@ async def test_model_picker_callbacks_navigate_and_switch_model(monkeypatch) -> 
     await adapter._dispatch_callback(model_callback)
 
     assert selected == [("user-1", "qwen/test", "custom")]
-    assert client.answers[-1][1]["message"]["text"] == "РњРѕРґРµР»СЊ РїРµСЂРµРєР»СЋС‡РµРЅР°"
+    assert client.answers[-1][1]["message"]["text"] == "Модель переключена"
 
 
 @pytest.mark.asyncio
@@ -266,7 +266,7 @@ async def test_approval_callback_resolves_hermes_and_is_answered(monkeypatch) ->
 
     assert resolved == [("session-1", "once")]
     assert client.answers[0][0] == "cb-1"
-    assert client.answers[0][1]["message"]["text"] == "Р Р°Р·СЂРµС€РµРЅРѕ РѕРґРёРЅ СЂР°Р·"
+    assert client.answers[0][1]["message"]["text"] == "Разрешено один раз"
 
 
 @pytest.mark.asyncio
@@ -304,4 +304,4 @@ async def test_clarify_other_callback_enables_gateway_text_capture(monkeypatch) 
     await adapter._dispatch_callback(callback)
 
     assert captured == ["clarify-1"]
-    assert client.answers[0][1]["message"]["text"] == "Р’РІРµРґРёС‚Рµ СЃРІРѕР№ РІР°СЂРёР°РЅС‚ СЃР»РµРґСѓСЋС‰РёРј СЃРѕРѕР±С‰РµРЅРёРµРј."
+    assert client.answers[0][1]["message"]["text"] == "Введите свой вариант следующим сообщением."
