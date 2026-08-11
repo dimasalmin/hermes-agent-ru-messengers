@@ -21,6 +21,23 @@
 
 ## 2. Установить внешний plugin
 
+Рекомендуемый способ для Hermes Agent — установить только VK-подкаталог из
+GitHub:
+
+```bash
+hermes plugins install dimasalmin/hermes-agent-ru-messengers/plugins/vk --enable
+```
+
+После установки проверьте plugin и перезапустите gateway:
+
+```bash
+hermes plugins list --user
+hermes doctor
+hermes gateway restart
+```
+
+Для разработки из локального checkout:
+
 ```bash
 pip install -e ".[vk]"
 ln -s "$(pwd)/plugins/vk" ~/.hermes/plugins/vk
