@@ -1,30 +1,25 @@
-# Hermes Agent VK plugin
+# Плагин VK для Hermes Agent
 
-This plugin connects Hermes Agent to a VK community bot through the official
-Community Long Poll API. It is an external plugin: Hermes core is not patched,
-so the plugin can be upgraded independently of Hermes releases.
+Внешний plugin подключает Hermes Agent к сообществу VK через Community Long
+Poll. Ядро Hermes не изменяется, поэтому plugin можно обновлять отдельно от
+релизов Hermes.
 
-## Implemented surface
+Установка из ссылки на репозиторий:
 
-- Direct `httpx` transport for VK API and Community Long Poll.
-- Durable schema-versioned `ts`, Long Poll server/key, poll lease, pairing and
-  message deduplication in SQLite.
-- DM/group routing through the shared allowlist policy.
-- 4096-character chunking, `messages.edit`, typing activity and standalone send.
-- VK `format_data` rendering for a bounded Markdown subset, with UTF-16 offsets.
-- Generic inline/chat keyboard builder for callback, text, open-link, location
-  and Mini App actions, with VK limit validation.
-- Native inline callback keyboards for clarify, dangerous-command approval and
-  slash confirmation. Payloads are opaque, short-lived, single-use and bound
-  to the VK user and peer.
-- Bounded HTTPS-only inbound photo, voice and document downloads into Hermes'
-  media cache, plus outbound photo/document/audio uploads.
+```bash
+hermes plugins install dimasalmin/hermes-agent-ru-messengers/plugins/vk --enable
+```
 
-Operator commands are registered as `hermes vk ...` when the running Hermes
-version exposes the plugin CLI hook. Pairing codes are issued by the operator,
-stored as hashes, and redeemed by the user with `/pair <code>`.
+Реализованы прямой HTTP-транспорт VK и Community Long Poll, устойчивое
+состояние и дедупликация в SQLite, маршрутизация DM/групп через allowlist,
+разбиение сообщений, редактирование, typing, pairing, callback-клавиатуры и
+ограниченный транспорт фото, голосовых сообщений и документов.
 
-## Required environment
+Команды оператора доступны как `hermes vk ...`, если установленная версия
+Hermes предоставляет CLI hook. Pairing-коды хранятся в SQLite только в виде
+хеша.
+
+## Обязательные переменные
 
 ```env
 VK_GROUP_TOKEN=<community access token>
@@ -32,6 +27,11 @@ VK_GROUP_ID=<numeric community id>
 VK_ALLOWED_USERS=<comma-separated VK user ids>
 ```
 
-The full setup, permissions, group behavior and diagnostics are in
-`../../docs/ru/vk-setup.md` and `../../docs/en/vk-setup.md`. Live acceptance
-and regional connectivity remain separate release gates.
+Полная русская инструкция: [настройка VK](https://github.com/dimasalmin/hermes-agent-ru-messengers/blob/main/docs/ru/vk-setup.md).
+
+## English summary
+
+External VK Community Long Poll plugin with allowlists, SQLite state,
+callbacks, pairing and bounded media transport. Install only the `plugins/vk`
+subdirectory, keep tokens out of chat history, and use the
+[English setup guide](https://github.com/dimasalmin/hermes-agent-ru-messengers/blob/main/docs/en/vk-setup.md).
