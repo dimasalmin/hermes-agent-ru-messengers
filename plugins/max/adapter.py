@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 
 PLATFORM_NAME = "max"
 PLATFORM_LABEL = "MAX Messenger"
-PLATFORM_EMOJI = "рџ’¬"
+PLATFORM_EMOJI = "💬"
 PLATFORM_HINT = (
     "You are chatting via MAX. Keep a response within MAX's 4000-character message limit. "
     "Use Markdown only where it improves readability; availability depends on the configured "
@@ -528,7 +528,500 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 )
                 continue
             try:
-                data, remote_mime = await self._client.download_…5511 tokens truncated…ping[str, Any]:
+                data, remote_mime = await self._client.download_media(
+                    attachment.url,
+                    max_bytes=getattr(self, "_media_max_bytes", DEFAULT_MEDIA_MAX_BYTES),
+                )
+                cached = _cache_media_bytes(
+                    data,
+                    filename=attachment.filename,
+                    mime_type=remote_mime or attachment.mime_type,
+                    default_kind=attachment.kind,
+                )
+            except (MaxApiError, OSError, ValueError) as exc:
+                logger.warning(
+                    "MAX media download/cache failed kind=%s error=%s",
+                    attachment.kind,
+                    exc,
+                )
+                event.text = _append_event_note(
+                    event.text,
+                    f"[MAX attachment '{attachment.filename}' could not be downloaded.]",
+                )
+                continue
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "MAX media cache failed kind=%s",
+                    attachment.kind,
+                )
+                event.text = _append_event_note(
+                    event.text,
+                    f"[MAX attachment '{attachment.filename}' could not be cached.]",
+                )
+                continue
+
+            if cached is None:
+                event.text = _append_event_note(
+                    event.text,
+                    f"[MAX attachment '{attachment.filename}' was not recognized as readable media.]",
+                )
+                continue
+            event.media_urls.append(cached.path)
+            event.media_types.append(cached.media_type)
+            event.text = _append_event_note(event.text, cached.context_note())
+            logger.info("MAX inbound media cached kind=%s", attachment.kind)
+
+    async def _dispatch_update(self, update: Mapping[str, Any]) -> None:
+        callback = MaxCallback.from_update(update)
+        if callback is not None:
+            await self._dispatch_callback(callback)
+            return
+
+        message = MaxMessage.from_update(update)
+        if message is None:
+            return
+        if self._bot_user_id and message.user_id == self._bot_user_id and message.is_bot:
+            return
+
+        is_group = message.is_group
+        target_type = "chat" if is_group else "user"
+        self._chat_target_types[message.chat_id] = target_type
+        if self._target_store is not None:
+            self._target_store.set(message.chat_id, target_type)
+        mentioned = self._is_mentioned(message.text)
+        if is_group:
+            if not self._access.can_group(message.user_id, message.chat_id, mentioned=mentioned):
+                return
+            if self._require_mention and not mentioned and not _is_command(message.text):
+                return
+        elif not self._access.can_dm(message.user_id):
+            return
+        if _is_command(message.text) and not self._access.can_run_command(
+            message.user_id, message.text, is_group=is_group
+        ):
+            return
+        event = _build_message_event(self, message)
+        await self._populate_message_media(message, event)
+        await self.handle_message(event)
+
+    async def _dispatch_callback(self, callback: MaxCallback) -> None:
+        """Resolve a MAX button through Hermes' native interactive hooks."""
+
+        if callback.is_group:
+            authorized = self._access.can_group(
+                callback.user_id, callback.chat_id, mentioned=False
+            )
+        else:
+            authorized = self._access.can_dm(callback.user_id)
+        if not authorized:
+            await self._answer_callback(callback, "Нет доступа к этой кнопке.")
+            return
+
+        entry = self._callbacks.consume(
+            callback.payload,
+            user_id=callback.user_id,
+            chat_id=callback.chat_id,
+        )
+        if entry is None:
+            await self._answer_callback(callback, "Кнопка устарела или уже использована.")
+            return
+
+        try:
+            if entry.kind == "approval":
+                from tools.approval import resolve_gateway_approval
+
+                count = resolve_gateway_approval(entry.session_key, entry.value)
+                labels = {
+                    "once": "Разрешено один раз",
+                    "session": "Разрешено на сессию",
+                    "always": "Разрешено всегда",
+                    "deny": "Запрещено",
+                }
+                label = labels.get(entry.value, "Запрос обработан") if count else "Запрос уже завершен"
+                await self._answer_callback(callback, label)
+                if count:
+                    resume = getattr(self, "resume_typing_for_chat", None)
+                    if callable(resume):
+                        resume(callback.chat_id)
+                return
+
+            if entry.kind == "slash":
+                from tools import slash_confirm
+
+                choice, confirm_id = entry.value.split(":", 1)
+                result_text = await slash_confirm.resolve(
+                    entry.session_key, confirm_id, choice
+                )
+                labels = {
+                    "once": "Подтверждено один раз",
+                    "always": "Подтверждено всегда",
+                    "cancel": "Отменено",
+                }
+                await self._answer_callback(callback, labels.get(choice, "Запрос обработан"))
+                if result_text:
+                    await self.send(
+                        callback.chat_id,
+                        str(result_text),
+                        metadata={
+                            "max_target_type": "chat" if callback.is_group else "user"
+                        },
+                    )
+                return
+
+            if entry.kind == "clarify":
+                clarify_id, choice_token = entry.value.split(":", 1)
+                if choice_token == "other":
+                    from tools.clarify_gateway import mark_awaiting_text
+
+                    if mark_awaiting_text(clarify_id):
+                        await self._answer_callback(
+                            callback, "Введите свой вариант следующим сообщением."
+                        )
+                    else:
+                        await self._answer_callback(callback, "Запрос уже завершен.")
+                    return
+
+                idx = int(choice_token)
+                resolved_text: Optional[str] = None
+                try:
+                    from tools.clarify_gateway import _entries as clarify_entries
+
+                    clarify_entry = clarify_entries.get(clarify_id)
+                    if clarify_entry and clarify_entry.choices and 0 <= idx < len(clarify_entry.choices):
+                        resolved_text = str(clarify_entry.choices[idx])
+                except Exception:
+                    resolved_text = None
+                resolved_text = resolved_text or f"choice {idx + 1}"
+
+                from tools.clarify_gateway import resolve_gateway_clarify
+
+                resolved = resolve_gateway_clarify(clarify_id, resolved_text)
+                await self._answer_callback(
+                    callback,
+                    f"Выбрано: {resolved_text}" if resolved else "Запрос уже завершен.",
+                )
+                return
+
+            if entry.kind == "model":
+                await self._dispatch_model_callback(callback, entry.value)
+                return
+
+            await self._answer_callback(callback, "Неизвестная кнопка.")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MAX callback resolution failed: %s", exc, exc_info=True)
+            await self._answer_callback(callback, "Не удалось обработать кнопку.")
+
+    async def _dispatch_model_callback(
+        self, callback: MaxCallback, value: str
+    ) -> None:
+        parts = str(value).split(":", 2)
+        if len(parts) < 2:
+            await self._answer_callback(callback, "Кнопка выбора модели некорректна.")
+            return
+        picker_id, action = parts[0], parts[1]
+        argument = parts[2] if len(parts) == 3 else ""
+        state = self._model_pickers.get(picker_id)
+        if state is None:
+            await self._answer_callback(callback, "Выбор модели устарел. Откройте /model заново.")
+            return
+
+        if action == "cancel":
+            self._model_pickers.pop(picker_id, None)
+            await self._answer_callback(callback, "Выбор модели отменен.")
+            return
+
+        if action == "back":
+            rows = self._model_provider_rows(state, picker_id, callback)
+            await self._answer_callback(
+                callback,
+                self._model_picker_provider_text(state),
+                attachments=[build_inline_keyboard(rows)],
+            )
+            return
+
+        if action == "provider":
+            provider = next(
+                (item for item in state["providers"] if str(item.get("slug")) == argument),
+                None,
+            )
+            if provider is None:
+                await self._answer_callback(callback, "Провайдер не найден.")
+                return
+            state["selected_provider"] = argument
+            state["selected_provider_name"] = str(provider.get("name") or argument)
+            state["model_list"] = [str(model) for model in provider.get("models", [])]
+            rows = self._model_rows(state, picker_id, callback)
+            await self._answer_callback(
+                callback,
+                self._model_picker_model_text(state),
+                attachments=[build_inline_keyboard(rows)],
+            )
+            return
+
+        if action == "model":
+            try:
+                index = int(argument)
+            except ValueError:
+                await self._answer_callback(callback, "Модель указана некорректно.")
+                return
+            models = state.get("model_list", [])
+            if index < 0 or index >= len(models):
+                await self._answer_callback(callback, "Модель не найдена.")
+                return
+            on_model_selected = state.get("on_model_selected")
+            if not callable(on_model_selected):
+                self._model_pickers.pop(picker_id, None)
+                await self._answer_callback(callback, "Выбор модели устарел.")
+                return
+            model_id = str(models[index])
+            provider_slug = str(state.get("selected_provider") or "")
+            try:
+                result_text = on_model_selected(callback.chat_id, model_id, provider_slug)
+                if inspect.isawaitable(result_text):
+                    result_text = await result_text
+                result_text = str(result_text or "Модель переключена.")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("MAX model picker switch failed: %s", exc, exc_info=True)
+                result_text = "Не удалось переключить модель."
+            self._model_pickers.pop(picker_id, None)
+            await self._answer_callback(callback, result_text)
+            return
+
+        await self._answer_callback(callback, "Неизвестное действие выбора модели.")
+
+    async def _answer_callback(
+        self,
+        callback: MaxCallback,
+        text: str,
+        *,
+        attachments: Optional[Iterable[Mapping[str, Any]]] = None,
+    ) -> None:
+        if self._client is None:
+            return
+        body = {
+            "text": str(text)[:MAX_MESSAGE_LENGTH],
+            "attachments": [dict(item) for item in attachments] if attachments is not None else [],
+            "format": "markdown",
+        }
+        try:
+            await self._rate_limiter.acquire(callback.chat_id)
+
+            async def _answer() -> Mapping[str, Any]:
+                return await self._client.answer_callback(
+                    callback.callback_id,
+                    message=body,
+                )
+
+            await with_backoff(
+                _answer,
+                is_rate_limit=_is_max_rate_limit,
+                extract_retry_after=_retry_after,
+            )
+        except MaxApiError as exc:
+            logger.warning("MAX callback answer failed: %s", exc)
+
+    def _is_mentioned(self, text: str) -> bool:
+        return bool(self._bot_username and f"@{self._bot_username.lower()}" in text.lower())
+
+    def _target_type_for(
+        self, chat_id: str, metadata: Optional[Mapping[str, Any]] = None
+    ) -> str:
+        target_type = self._chat_target_types.get(chat_id)
+        target_store = getattr(self, "_target_store", None)
+        if target_type is None and target_store is not None:
+            target_type = target_store.get(chat_id)
+        target_type = target_type or "user"
+        if metadata and metadata.get("max_target_type") in {"user", "chat"}:
+            target_type = str(metadata["max_target_type"])
+        return target_type
+
+    def _interactive_context(
+        self, chat_id: str, metadata: Optional[Mapping[str, Any]] = None
+    ) -> Optional[tuple[str, str]]:
+        target_type = self._target_type_for(chat_id, metadata)
+        user_id = ""
+        if metadata:
+            for key in ("max_user_id", "user_id", "sender_id"):
+                if metadata.get(key):
+                    user_id = str(metadata[key]).strip()
+                    break
+        if not user_id and target_type == "user":
+            user_id = str(chat_id).strip()
+        # Hermes currently supplies no sender identity in the generic control
+        # metadata for group prompts.  Refuse native buttons there so a second
+        # authorized group member cannot approve another user's request.
+        if not user_id:
+            return None
+        return target_type, user_id
+
+    async def _send_interactive_prompt(
+        self,
+        chat_id: str,
+        content: str,
+        rows: list[list[Mapping[str, str]]],
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
+        if self._client is None:
+            return SendResult(success=False, error="MAX adapter is not connected")
+        if not content:
+            return SendResult(success=False, error="MAX message is empty")
+        context = self._interactive_context(chat_id, metadata)
+        if context is None:
+            return SendResult(
+                success=False,
+                error="MAX native buttons require a user-bound direct message",
+            )
+        target_type, _user_id = context
+        try:
+            await self._rate_limiter.acquire(chat_id)
+
+            async def _send() -> Mapping[str, Any]:
+                return await self._client.send_message(
+                    chat_id,
+                    content[:MAX_MESSAGE_LENGTH],
+                    target_type=target_type,
+                    link=_reply_link(reply_to),
+                    attachments=[build_inline_keyboard(rows)],
+                )
+
+            response = await with_backoff(
+                _send,
+                is_rate_limit=_is_max_rate_limit,
+                extract_retry_after=_retry_after,
+            )
+        except MaxApiError as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=exc.retryable,
+                retry_after=exc.retry_after,
+            )
+        return SendResult(
+            success=True,
+            message_id=_response_message_id(response),
+            raw_response=response,
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        if self._client is None:
+            return SendResult(success=False, error="MAX adapter is not connected")
+        if not content:
+            return SendResult(success=False, error="MAX message is empty")
+        media_files, cleaned_content = self._extract_outbound_media(content)
+        if media_files:
+            return await self._send_media_files(
+                chat_id,
+                cleaned_content,
+                media_files,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        if "MEDIA:" in content and not callable(getattr(self, "extract_media", None)):
+            return SendResult(
+                success=False,
+                error="MAX media extraction is unavailable in this Hermes runtime",
+                retryable=False,
+            )
+
+        target_type = self._target_type_for(chat_id, metadata)
+        message_ids: list[str] = []
+        for index, chunk in enumerate(split_message(content, MAX_MESSAGE_LENGTH)):
+            link = _reply_link(reply_to) if index == 0 else None
+            await self._rate_limiter.acquire(chat_id)
+
+            async def _send() -> Mapping[str, Any]:
+                return await self._client.send_message(
+                    chat_id,
+                    chunk,
+                    target_type=target_type,
+                    link=link,
+                )
+
+            try:
+                response = await with_backoff(
+                    _send,
+                    is_rate_limit=_is_max_rate_limit,
+                    extract_retry_after=_retry_after,
+                )
+            except MaxApiError as exc:
+                return SendResult(
+                    success=False,
+                    error=str(exc),
+                    retryable=exc.retryable,
+                    retry_after=exc.retry_after,
+                )
+            message_id = _response_message_id(response)
+            if message_id:
+                message_ids.append(message_id)
+        return _send_result_from_ids(message_ids)
+
+    def _extract_outbound_media(self, content: str) -> tuple[list, str]:
+        if "MEDIA:" not in content:
+            return [], content
+        extractor = getattr(self, "extract_media", None)
+        if not callable(extractor):
+            return [], content
+        try:
+            media_files, cleaned = extractor(content)
+            filter_paths = getattr(self, "filter_media_delivery_paths", None)
+            if callable(filter_paths):
+                media_files = filter_paths(media_files)
+            return list(media_files or []), str(cleaned or "")
+        except Exception:  # noqa: BLE001
+            logger.exception("MAX outbound media extraction failed")
+            return [], content
+
+    async def _send_media_files(
+        self,
+        chat_id: str,
+        content: str,
+        media_files: list,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        if self._client is None:
+            return SendResult(success=False, error="MAX adapter is not connected")
+        target_type = self._target_type_for(chat_id, metadata)
+        attachments: list[Mapping[str, Any]] = []
+        try:
+            for item in media_files:
+                if isinstance(item, (tuple, list)):
+                    media_path = str(item[0])
+                    is_voice = bool(item[1]) if len(item) > 1 else False
+                else:
+                    media_path = str(item)
+                    is_voice = False
+                media_type = media_type_for_file(media_path, is_voice=is_voice)
+                upload = await self._client.upload_media(
+                    media_path,
+                    media_type=media_type,
+                    max_bytes=getattr(self, "_media_max_bytes", DEFAULT_MEDIA_MAX_BYTES),
+                    mime_type=mime_type_for_file(media_path, media_type),
+                )
+                token = str(upload.get("token") or "").strip()
+                if not token:
+                    raise MaxApiError("MAX media upload returned no attachment token")
+                attachments.append({"type": media_type, "payload": {"token": token}})
+        except (MaxApiError, OSError, ValueError) as exc:
+            return SendResult(success=False, error=str(exc), retryable=bool(getattr(exc, "retryable", False)))
+
+        chunks = split_message(content, MAX_MESSAGE_LENGTH) if content else [""]
+        message_ids: list[str] = []
+        for index, chunk in enumerate(chunks):
+            await self._rate_limiter.acquire(chat_id)
+            link = _reply_link(reply_to) if index == 0 else None
+            chunk_attachments = attachments if index == 0 else None
+
+            async def _send() -> Mapping[str, Any]:
                 return await self._client.send_message(
                     chat_id,
                     chunk,
@@ -566,7 +1059,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Any:
         if not choices:
-            return await self.send(chat_id, f"вќ“ {question}", metadata=metadata)
+            return await self.send(chat_id, f"❓ {question}", metadata=metadata)
 
         context = self._interactive_context(chat_id, metadata)
         if context is None:
@@ -593,10 +1086,10 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id=chat_id,
             session_key=session_key,
         )
-        rows.append([{"type": "callback", "text": "Р”СЂСѓРіРѕРµ", "payload": other_payload}])
+        rows.append([{"type": "callback", "text": "Другое", "payload": other_payload}])
         return await self._send_interactive_prompt(
             chat_id,
-            "вќ“ " + str(question) + "\n\n" + "\n".join(option_lines),
+            "❓ " + str(question) + "\n\n" + "\n".join(option_lines),
             rows,
             metadata=metadata,
         )
@@ -620,12 +1113,12 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 error="MAX native buttons require a user-bound direct message",
             )
         _target_type, user_id = context
-        choices: list[tuple[str, str]] = [("once", "Р Р°Р·СЂРµС€РёС‚СЊ РѕРґРёРЅ СЂР°Р·")]
+        choices: list[tuple[str, str]] = [("once", "Разрешить один раз")]
         if allow_session:
-            choices.append(("session", "Р Р°Р·СЂРµС€РёС‚СЊ РЅР° СЃРµСЃСЃРёСЋ"))
+            choices.append(("session", "Разрешить на сессию"))
         if allow_permanent:
-            choices.append(("always", "Р Р°Р·СЂРµС€РёС‚СЊ РІСЃРµРіРґР°"))
-        choices.append(("deny", "Р—Р°РїСЂРµС‚РёС‚СЊ"))
+            choices.append(("always", "Разрешить всегда"))
+        choices.append(("deny", "Запретить"))
         rows: list[list[Mapping[str, str]]] = []
         for index in range(0, len(choices), 2):
             row: list[Mapping[str, str]] = []
@@ -642,7 +1135,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         preview = str(command)
         if len(preview) > 3200:
             preview = preview[:3200] + "..."
-        text = f"вљ пёЏ РўСЂРµР±СѓРµС‚СЃСЏ РїРѕРґС‚РІРµСЂР¶РґРµРЅРёРµ РєРѕРјР°РЅРґС‹:\n\n```\n{preview}\n```\nРџСЂРёС‡РёРЅР°: {description}"
+        text = f"⚠️ Требуется подтверждение команды:\n\n```\n{preview}\n```\nПричина: {description}"
         return await self._send_interactive_prompt(chat_id, text, rows, metadata=metadata)
 
     async def send_slash_confirm(
@@ -662,9 +1155,9 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         _target_type, user_id = context
         choices = (
-            ("once", "РџРѕРґС‚РІРµСЂРґРёС‚СЊ РѕРґРёРЅ СЂР°Р·"),
-            ("always", "РџРѕРґС‚РІРµСЂР¶РґР°С‚СЊ РІСЃРµРіРґР°"),
-            ("cancel", "РћС‚РјРµРЅР°"),
+            ("once", "Подтвердить один раз"),
+            ("always", "Подтверждать всегда"),
+            ("cancel", "Отмена"),
         )
         rows: list[list[Mapping[str, str]]] = []
         for choice, label in choices:
@@ -747,7 +1240,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             count = provider.get("total_models", len(provider.get("models", [])))
             label = f"{name} ({count})"
             if slug == state.get("current_provider"):
-                label = f"вњ“ {label}"
+                label = f"✓ {label}"
             payload = self._callbacks.issue(
                 "model",
                 f"{picker_id}:provider:{slug}",
@@ -790,7 +1283,7 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id=callback.chat_id,
             session_key=str(state.get("session_key") or ""),
         )
-        rows.append([{"type": "callback", "text": "РќР°Р·Р°Рґ", "payload": back_payload}])
+        rows.append([{"type": "callback", "text": "Назад", "payload": back_payload}])
         rows.append([self._model_cancel_button(picker_id, callback.user_id, callback.chat_id, state)])
         return rows
 
@@ -808,19 +1301,19 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             chat_id=chat_id or str(state.get("chat_id") or "user"),
             session_key=str(state.get("session_key") or ""),
         )
-        return {"type": "callback", "text": "РћС‚РјРµРЅР°", "payload": payload}
+        return {"type": "callback", "text": "Отмена", "payload": payload}
 
     @staticmethod
     def _model_picker_provider_text(state: Mapping[str, Any]) -> str:
-        model = state.get("current_model") or "РЅРµРёР·РІРµСЃС‚РЅР°"
-        provider = state.get("current_provider") or "РЅРµРёР·РІРµСЃС‚РµРЅ"
-        return f"вљ™пёЏ РќР°СЃС‚СЂРѕР№РєР° РјРѕРґРµР»Рё\n\nРўРµРєСѓС‰Р°СЏ РјРѕРґРµР»СЊ: `{model}`\nРџСЂРѕРІР°Р№РґРµСЂ: {provider}\n\nР’С‹Р±РµСЂРёС‚Рµ РїСЂРѕРІР°Р№РґРµСЂР°:"
+        model = state.get("current_model") or "неизвестна"
+        provider = state.get("current_provider") or "неизвестен"
+        return f"⚙️ Настройка модели\n\nТекущая модель: `{model}`\nПровайдер: {provider}\n\nВыберите провайдера:"
 
     @staticmethod
     def _model_picker_model_text(state: Mapping[str, Any]) -> str:
         provider = state.get("selected_provider_name") or state.get("selected_provider")
         models = state.get("model_list", [])
-        return f"вљ™пёЏ РќР°СЃС‚СЂРѕР№РєР° РјРѕРґРµР»Рё\n\nРџСЂРѕРІР°Р№РґРµСЂ: {provider}\nР”РѕСЃС‚СѓРїРЅРѕ РјРѕРґРµР»РµР№: {len(models)}\n\nР’С‹Р±РµСЂРёС‚Рµ РјРѕРґРµР»СЊ:"
+        return f"⚙️ Настройка модели\n\nПровайдер: {provider}\nДоступно моделей: {len(models)}\n\nВыберите модель:"
 
     async def edit_message(
         self,
