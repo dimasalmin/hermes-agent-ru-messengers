@@ -216,7 +216,7 @@ async def test_adapter_caches_incoming_media_into_hermes_event(monkeypatch) -> N
         chat_id="user-1",
         chat_type="dialog",
         chat_title=None,
-        text="РџРѕСЃРјРѕС‚СЂРё",
+        text="Посмотри",
         attachments=(
             {
                 "type": "image",
@@ -256,7 +256,7 @@ async def test_adapter_sends_media_tag_as_token_attachment(monkeypatch) -> None:
     monkeypatch.setattr(
         adapter,
         "extract_media",
-        lambda _content: ([("/tmp/report.pdf", False)], "РћС‚С‡С‘С‚"),
+        lambda _content: ([("/tmp/report.pdf", False)], "Отчёт"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -266,13 +266,13 @@ async def test_adapter_sends_media_tag_as_token_attachment(monkeypatch) -> None:
         raising=False,
     )
 
-    result = await adapter.send("user-1", "MEDIA:/tmp/report.pdf\nРћС‚С‡С‘С‚")
+    result = await adapter.send("user-1", "MEDIA:/tmp/report.pdf\nОтчёт")
 
     assert result.success is True
     assert adapter._client.uploads == [
         ("/tmp/report.pdf", "file", 1024, "application/pdf")
     ]
-    assert adapter._client.sent[0][1] == "РћС‚С‡С‘С‚"
+    assert adapter._client.sent[0][1] == "Отчёт"
     assert adapter._client.sent[0][2]["attachments"] == [
         {"type": "file", "payload": {"token": "file-token"}}
     ]
@@ -308,7 +308,7 @@ async def test_standalone_sender_delivers_media_files(monkeypatch, tmp_path) -> 
     result = await standalone_send(
         config,
         "user-1",
-        "РћС‚С‡С‘С‚",
+        "Отчёт",
         media_files=["report.pdf"],
     )
 
