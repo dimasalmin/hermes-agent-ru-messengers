@@ -1,6 +1,6 @@
-# Hermes Agent — плагины MAX и VK / MAX and VK plugins
+# Hermes Agent — плагины MAX и VK
 
-[Русская версия](#русская-версия) · [English version](#english-version)
+[Русская версия](#русская-версия) · [English summary](#english-summary)
 
 ## Русская версия
 
@@ -9,84 +9,28 @@
 - MAX Bot API v2 через HTTPS Webhook или Long Polling для разработки;
 - VK Community Long Poll с прямым HTTP-транспортом.
 
-Код находится вне ядра Hermes Agent, поэтому Hermes можно обновлять и откатывать независимо от этих интеграций.
+Плагины находятся вне ядра Hermes Agent, поэтому Hermes можно обновлять и откатывать независимо от этих интеграций.
 
-Проект экспериментальный. Локальная проверка прошла: 133 детерминированных теста и loader checks. При этом рабочая проверка MAX/VK всё ещё требует одноразовых учётных данных и реального тестового пользователя или сообщества.
+Проект экспериментальный. Локальная проверка включает 133 детерминированных теста и loader checks. Рабочая проверка MAX/VK всё ещё требует одноразовых учётных данных и реального тестового пользователя или сообщества.
 
 Проект не гарантирует доступность MAX/VK, прохождение whitelist-политик или сетевую доступность у конкретного оператора. Это нужно отдельно проверять для региона, оператора, устройства и режима сбоя.
 
-Установка и настройка:
+### Что входит
+
+- MAX Bot API v2, текстовая маршрутизация, Webhook/Long Polling, callback-кнопки, выбор модели, ограниченный транспорт медиа и проверка TLS;
+- VK Community Long Poll, устойчивый marker и дедупликация, прямой API-клиент, callbacks, typing, редактирование сообщений, pairing, allowlist и ограниченный транспорт медиа;
+- манифесты `plugin.yaml`, адаптеры платформ, standalone sender hooks, contract tests и loader smoke scripts.
+
+### Установка и настройка
+
+Копируйте или подключайте только каталоги плагинов в пользовательский каталог Hermes. Не копируйте их в исходное дерево Hermes.
 
 - [настройка MAX](docs/ru/max-setup.md);
 - [настройка VK](docs/ru/vk-setup.md);
-- [интерактивные сценарии MAX](docs/ru/max-interactive.md).
+- [интерактивные сценарии MAX](docs/ru/max-interactive.md);
+- [зачем Hermes нужны российские мессенджеры](docs/ru/why-russian-messengers.md).
 
-Для разработки:
-
-```bash
-python -m pip install -e ".[dev]"
-python -m pytest -q
-python -m compileall -q plugins tests scripts
-```
-
-Никогда не публикуйте токены, cookies, базы данных, логи или production-конфигурацию. Включайте плагины только после проверки их поведения и allowlist-настроек.
-
-## English version
-
-Unofficial external platform plugins for [Hermes Agent](https://github.com/NousResearch/hermes-agent):
-
-- MAX Bot API v2 through HTTPS Webhook or development Long Polling;
-- VK Community Long Poll with direct HTTP transport.
-
-The code stays outside the Hermes core checkout, so Hermes can be upgraded or
-rolled back independently.
-
-## Status
-
-This is an experimental community project. The latest local implementation
-verification passed 133 deterministic tests and loader checks, but live
-acceptance still requires disposable MAX/VK credentials and a real test
-user/community.
-
-The project does not promise universal MAX/VK availability, whitelist behavior,
-or regulator/operator connectivity. Measure those separately for the target
-region, operator, device, and incident mode.
-
-Implemented areas include:
-
-- MAX Bot API v2 client, text routing, Webhook/Long Polling, callback keyboards,
-  model picker, bounded media transport, and TLS validation;
-- VK Community Long Poll, durable marker and deduplication, direct API client,
-  callbacks, typing, message edits, pairing, allowlists, and bounded media;
-- Hermes `plugin.yaml` manifests, platform adapters, standalone sender hooks,
-  contract tests, and loader smoke scripts.
-
-Known release gates:
-
-- live MAX callback and inbound/outbound media acceptance;
-- live VK Community Long Poll, callback, and media acceptance;
-- compatibility checks against the installed Hermes version after upgrades;
-- real network availability in the intended region and operator environment.
-
-## Install
-
-Clone this repository, then link or copy only the plugin directories into the
-Hermes user plugin directory. Do not copy them into the Hermes source tree.
-
-PowerShell example:
-
-```powershell
-$repo = (Get-Location).Path
-New-Item -ItemType Junction `
-  -Path "$HOME\.hermes\plugins\max" `
-  -Target "$repo\plugins\max"
-New-Item -ItemType Junction `
-  -Path "$HOME\.hermes\plugins\vk" `
-  -Target "$repo\plugins\vk"
-```
-
-The plugin manifest must remain named `plugin.yaml`. Third-party plugins are
-opt-in in Hermes; enable only the platform you have reviewed:
+После изменения Hermes запускайте loader smoke test до перезапуска production gateway. Third-party plugins в Hermes включаются явно:
 
 ```bash
 hermes plugins list
@@ -94,10 +38,7 @@ hermes plugins enable max-platform
 hermes plugins enable vk
 ```
 
-Run the loader smoke test after changing Hermes and before restarting a
-production gateway.
-
-## Development
+### Разработка
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -105,49 +46,39 @@ python -m pytest -q
 python -m compileall -q plugins tests scripts
 ```
 
-Live checks require secrets supplied only through the environment. Never put
-real tokens, cookies, databases, logs, or production configuration in Git:
+Секреты для live-проверок передавайте только через окружение. Не публикуйте токены, cookies, базы данных, логи или production-конфигурацию.
 
-```bash
-python scripts/max_live_smoke.py --user-id 100000001 --poll-seconds 30
-python scripts/max_adapter_live_smoke.py --seconds 8
-python scripts/vk_loader_smoke.py --hermes-root /home/user/.hermes/hermes-agent
-```
+### Конфигурация
 
-The live scripts are diagnostics, not a production readiness claim.
-
-## Configuration
-
-MAX requires at least:
+MAX:
 
 ```env
-MAX_BOT_TOKEN=<token from MAX for Business>
-MAX_ALLOWED_USERS=<numeric MAX user IDs separated by commas>
+MAX_BOT_TOKEN=<токен MAX for Business>
+MAX_ALLOWED_USERS=<числовые ID пользователей через запятую>
 ```
 
-VK requires at least:
+VK:
 
 ```env
-VK_GROUP_TOKEN=<community access token>
-VK_GROUP_ID=<numeric VK community ID>
-VK_ALLOWED_USERS=<numeric VK user IDs separated by commas>
+VK_GROUP_TOKEN=<токен сообщества>
+VK_GROUP_ID=<числовой ID сообщества VK>
+VK_ALLOWED_USERS=<числовые ID пользователей через запятую>
 ```
 
-Both adapters default to restrictive allowlist behavior. Review the complete
-environment reference in [MAX setup](docs/en/max-setup.md) and [VK setup](docs/en/vk-setup.md).
-Russian instructions are available in [MAX setup](docs/ru/max-setup.md) and
-[VK setup](docs/ru/vk-setup.md).
+Оба адаптера по умолчанию используют ограничительный allowlist. Изучите полные параметры в инструкциях настройки.
 
-## Security boundary
+### Безопасность и лицензия
 
-The adapters process third-party network input and should be enabled only after
-review. The implementation uses allowlists, bounded media reads, token
-redaction, HTTPS host checks, callback expiry/binding, and TLS verification.
-These controls reduce risk but do not replace deployment-specific review.
+Адаптеры обрабатывают внешние сетевые данные, вложения, callbacks и API-учётные данные. В реализации есть allowlists, ограничение размера медиа, redaction токенов, проверки HTTPS-хостов, привязка и срок действия callbacks, а также проверка TLS. Эти меры не заменяют проверку конкретного развёртывания.
 
-Report security issues privately according to [SECURITY.md](SECURITY.md). Do not
-open a public issue containing credentials, private messages, or exploit details.
+Сообщайте о проблемах безопасности приватно по правилам [SECURITY.md](SECURITY.md). Лицензия — [MIT](LICENSE).
 
-## License
+## English summary
 
-MIT. See [LICENSE](LICENSE).
+Unofficial external MAX and VK platform plugins for Hermes Agent.
+
+The project is experimental: 133 deterministic tests pass locally, while live MAX/VK acceptance and regional connectivity remain deployment-specific.
+
+See the [English MAX setup](docs/en/max-setup.md), [English VK setup](docs/en/vk-setup.md), and [English interactive MAX guide](docs/en/max-interactive.md).
+
+Keep the plugins outside the Hermes core checkout, enable only reviewed platforms, and never commit credentials or production data. Licensed under [MIT](LICENSE).
