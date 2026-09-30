@@ -17,7 +17,7 @@ from typing import Awaitable, Callable, TypeVar
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 4000
-MAX_ATTACHMENT_SIZE = 50 * 1024 * 1024  # 50 MB; refine once API surfaces explicit limit
+MAX_ATTACHMENT_SIZE = 50_000_000  # Decimal 50 MB, matching the plugin media cap.
 # MAX permits up to 12 image/video media attachments in one message.  Files
 # and audio are split by the adapter because the API applies stricter rules to
 # those combinations.

@@ -3,8 +3,14 @@ from __future__ import annotations
 import httpx
 import pytest
 from json import loads
+from PIL import Image
 
 from plugins.max.client import DEFAULT_API_BASE, MaxApiError, MaxClient
+
+
+def _write_png(path) -> None:
+    image = Image.new("RGB", (1, 1))
+    image.save(path, format="PNG")
 
 
 def _client(handler):
@@ -109,6 +115,25 @@ async def test_subscribe_webhook_sends_secret_and_update_types() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.test/max",
+        "https://example.test:8443/max",
+        "https://user:pass@example.test/max",
+        "https://127.0.0.1/max",
+    ],
+)
+async def test_subscribe_webhook_rejects_nonpublic_or_non443_urls(url: str) -> None:
+    client = _client(lambda request: httpx.Response(500, request=request))
+    try:
+        with pytest.raises(ValueError):
+            await client.subscribe_webhook(url, "webhook-secret")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_get_updates_preserves_marker_and_timeout() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/updates"
@@ -160,7 +185,7 @@ async def test_commands_actions_and_video_resolution_use_documented_routes() -> 
 @pytest.mark.asyncio
 async def test_upload_uses_nested_photos_token_only_after_success(tmp_path) -> None:
     path = tmp_path / "photo.png"
-    path.write_bytes(b"png")
+    _write_png(path)
 
     async def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -179,7 +204,7 @@ async def test_upload_uses_nested_photos_token_only_after_success(tmp_path) -> N
     media_http = httpx.AsyncClient(transport=httpx.MockTransport(media_handler))
     client = MaxClient("secret-token", http_client=api_http, media_http_client=media_http)
     try:
-        result = await client.upload_media(path, media_type="image", max_bytes=16)
+        result = await client.upload_media(path, media_type="image", max_bytes=256)
     finally:
         await client.close()
 
@@ -189,7 +214,7 @@ async def test_upload_uses_nested_photos_token_only_after_success(tmp_path) -> N
 @pytest.mark.asyncio
 async def test_upload_extracts_token_from_live_photos_id_map(tmp_path) -> None:
     path = tmp_path / "photo.png"
-    path.write_bytes(b"png")
+    _write_png(path)
 
     async def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -212,7 +237,7 @@ async def test_upload_extracts_token_from_live_photos_id_map(tmp_path) -> None:
     media_http = httpx.AsyncClient(transport=httpx.MockTransport(media_handler))
     client = MaxClient("secret-token", http_client=api_http, media_http_client=media_http)
     try:
-        result = await client.upload_media(path, media_type="image", max_bytes=16)
+        result = await client.upload_media(path, media_type="image", max_bytes=256)
     finally:
         await client.close()
 
@@ -222,7 +247,7 @@ async def test_upload_extracts_token_from_live_photos_id_map(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_upload_does_not_use_initial_token_after_failed_multipart(tmp_path) -> None:
     path = tmp_path / "photo.png"
-    path.write_bytes(b"png")
+    _write_png(path)
 
     async def api_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -242,7 +267,7 @@ async def test_upload_does_not_use_initial_token_after_failed_multipart(tmp_path
     client = MaxClient("secret-token", http_client=api_http, media_http_client=media_http)
     try:
         with pytest.raises(MaxApiError):
-            await client.upload_media(path, media_type="image", max_bytes=16)
+            await client.upload_media(path, media_type="image", max_bytes=256)
     finally:
         await client.close()
 

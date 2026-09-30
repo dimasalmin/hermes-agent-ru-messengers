@@ -3,89 +3,90 @@ label: MAX
 kind: platform
 version: 0.2.0
 description: >
-  External Hermes Agent adapter for MAX Bot API v2. Uses the documented
-  platform-api2.max.ru REST API, HTTPS Webhook or development Long Polling,
-  strict allowlist policy, and TLS verification.
+  Внешний адаптер Hermes Agent для MAX Bot API v2. Поддерживает REST API
+  platform-api2.max.ru, HTTPS Webhook для постоянной работы и Long Polling для
+  разработки и проверок. Использует строгий список разрешённых пользователей
+  и проверку TLS.
 author: Hermes Agent RU Messenger contributors
 license: MIT
 homepage: https://github.com/NousResearch/hermes-agent
 
 requires_env:
   - name: MAX_BOT_TOKEN
-    description: "Bot token created in MAX for Business"
-    prompt: "MAX Bot API token"
+    description: "Токен бота, созданный в MAX для бизнеса"
+    prompt: "Токен MAX Bot API"
     password: true
     category: messaging
     url: "https://business.max.ru/"
 
 optional_env:
   - name: MAX_ALLOWED_USERS
-    description: "Comma-separated MAX user IDs allowed to use the bot"
-    prompt: "Allowed MAX users"
+    description: "Разрешённые ID пользователей MAX через запятую"
+    prompt: "Разрешённые пользователи MAX"
     password: false
     category: messaging
   - name: MAX_GROUP_ALLOWED_USERS
-    description: "Comma-separated user IDs allowed in groups"
-    prompt: "Allowed MAX group users"
+    description: "Разрешённые в группах ID пользователей через запятую"
+    prompt: "Разрешённые участники групп MAX"
     password: false
     category: messaging
   - name: MAX_GROUP_ALLOWED_CHATS
-    description: "Comma-separated group chat IDs allowed for the bot"
-    prompt: "Allowed MAX group chats"
+    description: "Разрешённые ID групповых чатов через запятую"
+    prompt: "Разрешённые групповые чаты MAX"
     password: false
     category: messaging
   - name: MAX_ADMIN_USERS
-    description: "Comma-separated MAX user IDs allowed to approve and run group control actions"
-    prompt: "MAX group administrators"
+    description: "ID пользователей, которым разрешены подтверждения и управление в группах"
+    prompt: "Администраторы групп MAX"
     password: false
     category: messaging
   - name: MAX_ALLOW_ALL_USERS
-    description: "Development-only override that disables the allowlist"
-    prompt: "Allow all MAX users?"
+    description: "Только для разработки: отключает проверку списка разрешённых пользователей"
+    prompt: "Разрешить всех пользователей MAX?"
     password: false
     category: messaging
   - name: MAX_WEBHOOK_URL
-    description: "HTTPS Webhook URL on the required public port 443"
-    prompt: "MAX Webhook URL"
+    description: "Публичный HTTPS-адрес Webhook на порту 443"
+    prompt: "Адрес Webhook MAX"
     password: false
     category: messaging
   - name: MAX_WEBHOOK_SECRET
-    description: "Secret sent in X-Max-Bot-Api-Secret"
-    prompt: "MAX Webhook secret"
+    description: "Секрет для заголовка X-Max-Bot-Api-Secret"
+    prompt: "Секрет Webhook MAX"
     password: true
     category: messaging
   - name: MAX_CA_BUNDLE
-    description: "Optional PEM bundle containing the MAX trusted chain"
-    prompt: "MAX CA bundle path"
+    description: "Необязательный PEM-файл с доверенной цепочкой сертификатов MAX"
+    prompt: "Путь к PEM-файлу сертификатов MAX"
     password: false
     category: messaging
   - name: MAX_API_BASE_URL
-    description: "Advanced override; defaults to https://platform-api2.max.ru"
-    prompt: "MAX API base URL"
+    description: "Расширенная настройка; по умолчанию https://platform-api2.max.ru"
+    prompt: "Базовый адрес MAX API"
     password: false
     category: messaging
   - name: MAX_INBOX_PATH
-    description: "Shared SQLite inbox path used by Hermes and the optional Webhook ingress"
-    prompt: "MAX Webhook inbox path"
+    description: "Общий путь SQLite-очереди для Hermes и Webhook-приёмника"
+    prompt: "Путь к SQLite-очереди MAX Webhook"
     password: false
     category: messaging
   - name: MAX_MARKER_PATH
-    description: "SQLite path for the Long Polling marker"
-    prompt: "MAX polling marker path"
+    description: "Путь к SQLite-файлу маркера Long Polling"
+    prompt: "Путь к маркеру Long Polling MAX"
     password: false
     category: messaging
   - name: MAX_TARGET_PATH
-    description: "SQLite path for persisted MAX user/chat target types"
-    prompt: "MAX target state path"
+    description: "Путь к SQLite-файлу с типами диалогов и групп MAX"
+    prompt: "Путь к состоянию чатов MAX"
     password: false
     category: messaging
   - name: MAX_CALLBACK_TTL_SECONDS
-    description: "Lifetime of native MAX button callbacks in seconds"
-    prompt: "MAX button callback TTL"
+    description: "Срок действия нажатий кнопок MAX в секундах"
+    prompt: "Срок действия кнопок MAX"
     password: false
     category: messaging
   - name: MAX_MEDIA_MAX_BYTES
-    description: "Maximum size of one inbound or outbound media attachment"
-    prompt: "MAX media size limit in bytes"
+    description: "Максимум одного входящего или исходящего вложения; не более 50000000 байт"
+    prompt: "Размер вложения MAX в байтах, не более 50000000"
     password: false
     category: messaging

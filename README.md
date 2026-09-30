@@ -11,13 +11,13 @@
 
 Плагины находятся вне ядра Hermes Agent, поэтому Hermes можно обновлять и откатывать независимо от этих интеграций.
 
-Проект экспериментальный. Локальная проверка включает 133 детерминированных теста и loader checks. Рабочая проверка MAX/VK всё ещё требует одноразовых учётных данных и реального тестового пользователя или сообщества.
+Проект экспериментальный. Локальная проверка включает pytest-набор и contract smoke с настоящим Hermes; рабочая проверка MAX/VK всё ещё требует тестового пользователя или сообщества.
 
 Проект не гарантирует доступность MAX/VK, прохождение whitelist-политик или сетевую доступность у конкретного оператора. Это нужно отдельно проверять для региона, оператора, устройства и режима сбоя.
 
 ### Что входит
 
-- MAX Bot API v2, текстовая маршрутизация, Webhook/Long Polling, callback-кнопки, выбор модели, двусторонний транспорт изображений, документов, аудио и видео до 50 MiB, меню команд и проверка TLS;
+- MAX Bot API v2, текстовая маршрутизация, Webhook/Long Polling, callback-кнопки, выбор модели, двусторонний транспорт изображений, документов, аудио и видео до 50 000 000 байт на файл; изображения проверяются по пределу 7680 пикселей на сторону;
 - VK Community Long Poll, устойчивый marker и дедупликация, прямой API-клиент, callbacks, typing, редактирование сообщений, pairing, allowlist и ограниченный транспорт медиа;
 - манифесты `plugin.yaml`, адаптеры платформ, standalone sender hooks, contract tests и loader smoke scripts.
 
@@ -125,7 +125,7 @@ VK_ALLOWED_USERS=<числовые ID пользователей через за
 
 Unofficial external MAX and VK platform plugins for Hermes Agent.
 
-The project is experimental: 133 deterministic tests pass locally, while live MAX/VK acceptance and regional connectivity remain deployment-specific.
+The project is experimental: automated tests and pinned Hermes contract checks cover local behavior, while live MAX/VK acceptance and regional connectivity remain deployment-specific.
 
 See the [English MAX setup](docs/en/max-setup.md), [English VK setup](docs/en/vk-setup.md), and [English interactive MAX guide](docs/en/max-interactive.md).
 

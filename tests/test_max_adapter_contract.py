@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 from types import SimpleNamespace
 
@@ -82,6 +83,69 @@ def test_send_result_marks_last_message_and_keeps_prior_continuations() -> None:
 def test_reply_link_uses_max_mid_field() -> None:
     assert adapter_module._reply_link("in-1") == {"type": "reply", "mid": "in-1"}
     assert adapter_module._reply_link(None) is None
+    assert adapter_module._reply_message_id({"type": "reply", "mid": "in-1"}) == "in-1"
+    assert adapter_module._reply_message_id(
+        {"type": "reply", "message": {"body": {"mid": "in-2"}}}
+    ) == "in-2"
+
+
+def test_group_reply_is_a_mention_only_when_linked_sender_is_the_bot() -> None:
+    bot_id = "900"
+    assert adapter_module._is_reply_to_bot(
+        {"type": "reply", "sender": {"user_id": 900, "is_bot": True}}, bot_id
+    )
+    assert not adapter_module._is_reply_to_bot(
+        {"type": "reply", "sender": {"user_id": 42, "is_bot": False}}, bot_id
+    )
+    assert not adapter_module._is_reply_to_bot(
+        {"type": "forward", "sender": {"user_id": 900, "is_bot": True}}, bot_id
+    )
+    assert not adapter_module._is_reply_to_bot(
+        {"sender": {"user_id": 900, "is_bot": True}}, bot_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_downloads_are_serial_per_chat_and_parallel_across_chats() -> None:
+    adapter = object.__new__(MaxAdapter)
+    adapter._media_download_semaphore = asyncio.Semaphore(2)
+    adapter._chat_media_download_locks = {}
+    active = 0
+    maximum_active = 0
+
+    async def populate(_message, _event):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+
+    adapter._populate_message_media = populate
+
+    def message(chat_id: str, user_id: str) -> MaxMessage:
+        return MaxMessage(
+            message_id=f"{chat_id}-{user_id}",
+            user_id=user_id,
+            user_name=None,
+            chat_id=chat_id,
+            chat_type="chat",
+            chat_title=None,
+            text="",
+            attachments=({"type": "file"},),
+        )
+
+    await asyncio.gather(
+        adapter._download_media_for_chat(message("group-1", "user-1"), None),
+        adapter._download_media_for_chat(message("group-1", "user-2"), None),
+    )
+    assert maximum_active == 1
+
+    maximum_active = 0
+    await asyncio.gather(
+        adapter._download_media_for_chat(message("group-2", "user-3"), None),
+        adapter._download_media_for_chat(message("group-3", "user-4"), None),
+    )
+    assert maximum_active == 2
 
 
 def test_max_menu_uses_installed_gateway_registry_and_plugin_diagnostics() -> None:
@@ -170,3 +234,103 @@ def test_group_message_scopes_hermes_session_by_participant() -> None:
     assert event.source.chat_id == "9001::user::42"
     assert event.metadata["max_chat_id"] == "9001"
     assert event.metadata["max_target_type"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_processing_hooks_track_hermes_start_and_completion(tmp_path) -> None:
+    from plugins.max.polling_state import PollingMarkerStore
+
+    update = {"update_type": "message_created", "update_id": 22}
+    store = PollingMarkerStore(tmp_path / "polling.sqlite3")
+    store.accept_batch([update], 22)
+    store.claim_next()
+    adapter = object.__new__(MaxAdapter)
+    adapter._webhook_mode = False
+    adapter._marker_store = store
+    adapter._receiver = None
+    event = SimpleNamespace(metadata={"max_update_event_key": "update:22"})
+
+    await adapter.on_processing_start(event)
+    assert store.status_summary()["processing"] == 1
+    await adapter.on_processing_complete(event, "SUCCESS")
+    assert store.status_summary()["processed"] == 1
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_polling_continues_receiving_while_workers_process_media(tmp_path) -> None:
+    from plugins.max.polling_state import PollingMarkerStore
+
+    next_poll = asyncio.Event()
+
+    class Client:
+        calls = 0
+
+        async def get_updates(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"marker": 31, "updates": [{"update_type": "message_created", "update_id": 31}]}
+            next_poll.set()
+            await asyncio.Future()
+
+    adapter = object.__new__(MaxAdapter)
+    adapter._running = True
+    adapter._client = Client()
+    adapter._polling_timeout = 90
+    adapter._marker_store = PollingMarkerStore(tmp_path / "polling.sqlite3")
+    adapter._inbox_wakeup = asyncio.Event()
+    task = asyncio.create_task(adapter._poll_updates())
+    try:
+        await asyncio.wait_for(next_poll.wait(), timeout=1)
+        assert adapter._marker_store.status_summary()["pending"] == 1
+        assert adapter._marker_store.get() == 31
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        adapter._marker_store.close()
+
+
+@pytest.mark.asyncio
+async def test_reserved_control_worker_runs_while_media_dispatch_is_blocked(tmp_path) -> None:
+    from plugins.max.polling_state import PollingMarkerStore
+
+    store = PollingMarkerStore(tmp_path / "polling.sqlite3")
+    media = {"update_type": "message_created", "update_id": 41}
+    callback = {"update_type": "message_callback", "callback": {"callback_id": "cb-42"}}
+    store.accept_batch([media, callback], 42)
+    media_started = asyncio.Event()
+    callback_done = asyncio.Event()
+    release_media = asyncio.Event()
+    adapter = object.__new__(MaxAdapter)
+    adapter._running = True
+    adapter._webhook_mode = False
+    adapter._marker_store = store
+    adapter._receiver = None
+    adapter._inbox_wakeup = asyncio.Event()
+    adapter._inbox_wakeup.set()
+
+    async def dispatch(update):
+        if update.get("update_type") == "message_created":
+            media_started.set()
+            await release_media.wait()
+        else:
+            callback_done.set()
+        return "processed"
+
+    adapter._dispatch_update = dispatch
+    workers = [
+        asyncio.create_task(adapter._consume_durable_updates(control_only=True)),
+        asyncio.create_task(adapter._consume_durable_updates(control_only=False)),
+    ]
+    try:
+        await asyncio.wait_for(media_started.wait(), timeout=1)
+        await asyncio.wait_for(callback_done.wait(), timeout=1)
+        assert store.status_summary()["dispatching"] == 1
+        assert store.status_summary()["processed"] == 1
+    finally:
+        release_media.set()
+        adapter._running = False
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        store.close()

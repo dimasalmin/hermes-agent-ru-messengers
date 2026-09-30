@@ -8,13 +8,25 @@ the adapter and delegated to Hermes' existing media cache.
 from __future__ import annotations
 
 import ipaddress
+from io import BytesIO
 from dataclasses import dataclass
 from mimetypes import guess_type
 from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import unquote, urlsplit
 
+from PIL import Image, UnidentifiedImageError
+
+try:
+    from pillow_heif import register_heif_opener
+except ImportError:
+    _HEIF_AVAILABLE = False
+else:
+    register_heif_opener(thumbnails=False)
+    _HEIF_AVAILABLE = True
+
 MAX_ATTACHMENT_TYPES = frozenset({"image", "video", "audio", "file", "voice"})
+MAX_IMAGE_DIMENSION = 7680
 DEFAULT_MEDIA_HOSTS = ("max.ru", "oneme.ru", "okcdn.ru")
 OUTBOUND_MEDIA_HOSTS = DEFAULT_MEDIA_HOSTS + (
     "fal.media",
@@ -28,9 +40,37 @@ _DEFAULT_MIME = {
     "audio": "audio/ogg",
     "file": "application/octet-stream",
 }
-_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".tiff", ".bmp", ".heic", ".webp"})
+_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff", ".bmp", ".heic"})
 _VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".mkv", ".webm"})
 _AUDIO_EXTENSIONS = frozenset({".mp3", ".wav", ".m4a", ".ogg", ".opus", ".flac", ".aac"})
+
+
+def validate_image_dimensions(
+    source: bytes | bytearray | str | Path,
+    *,
+    filename: Optional[str] = None,
+) -> tuple[int, int]:
+    """Validate an image header without decoding its pixels into memory."""
+
+    if filename:
+        suffix = Path(filename).suffix.lower()
+    elif isinstance(source, (bytes, bytearray)):
+        suffix = ""
+    else:
+        suffix = Path(source).suffix.lower()
+    if suffix == ".heic" and not _HEIF_AVAILABLE:
+        raise ValueError("HEIC dimension validation requires the pillow-heif dependency")
+    image_source = BytesIO(source) if isinstance(source, (bytes, bytearray)) else Path(source)
+    try:
+        with Image.open(image_source) as image:
+            width, height = image.size
+    except (Image.DecompressionBombError, OSError, UnidentifiedImageError, ValueError) as exc:
+        raise ValueError("MAX image is not a readable image") from exc
+    if width <= 0 or height <= 0 or max(width, height) > MAX_IMAGE_DIMENSION:
+        raise ValueError(
+            f"MAX image dimensions must not exceed {MAX_IMAGE_DIMENSION} pixels per side"
+        )
+    return width, height
 
 
 @dataclass(frozen=True)

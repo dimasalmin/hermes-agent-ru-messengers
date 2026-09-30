@@ -7,20 +7,22 @@ SDK release timing and makes authorization/TLS behavior testable.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
 from .media import DEFAULT_MEDIA_HOSTS, is_allowed_media_url
+from .media import validate_image_dimensions
 
 DEFAULT_API_BASE = "https://platform-api2.max.ru"
 DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=60.0, write=60.0, pool=15.0)
 _SECRET_PATTERN = re.compile(r"^[A-Za-z0-9_-]{5,256}$")
 MAX_UPLOAD_TYPES = frozenset({"image", "video", "audio", "file"})
-DEFAULT_MEDIA_MAX_BYTES = 50 * 1024 * 1024
+DEFAULT_MEDIA_MAX_BYTES = 50_000_000
 
 
 def _attachment_token(value: Any) -> Optional[str]:
@@ -240,6 +242,7 @@ class MaxClient:
             raise MaxApiError("MAX media URL is not allowed")
         if max_bytes <= 0:
             raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
 
         current_url = str(url)
         media_http = self._get_media_http()
@@ -361,6 +364,7 @@ class MaxClient:
             raise ValueError(f"Unsupported MAX upload type: {media_type}")
         if max_bytes <= 0:
             raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
         path = Path(file_path)
         try:
             if not path.is_file():
@@ -370,6 +374,11 @@ class MaxClient:
             raise MaxApiError(f"MAX media file is not readable: {path.name}") from exc
         if size > max_bytes:
             raise MaxApiError("MAX media file exceeds configured size limit")
+        if media_type == "image":
+            try:
+                validate_image_dimensions(path)
+            except ValueError as exc:
+                raise MaxApiError(str(exc)) from exc
 
         upload_info = await self._request(
             "POST", "/uploads", params={"type": media_type}
@@ -411,8 +420,14 @@ class MaxClient:
             raise ValueError(f"Unsupported MAX upload type: {media_type}")
         if max_bytes <= 0:
             raise ValueError("MAX media max_bytes must be positive")
+        max_bytes = min(int(max_bytes), DEFAULT_MEDIA_MAX_BYTES)
         if len(data) > max_bytes:
             raise MaxApiError("MAX media file exceeds configured size limit")
+        if media_type == "image":
+            try:
+                validate_image_dimensions(data, filename=filename)
+            except ValueError as exc:
+                raise MaxApiError(str(exc)) from exc
         safe_name = Path(str(filename or "attachment")).name or "attachment"
         safe_name = "".join(
             char for char in safe_name if ord(char) >= 32 and char != "\x7f"
@@ -510,8 +525,25 @@ class MaxClient:
         *,
         update_types: Optional[Iterable[str]] = None,
     ) -> Mapping[str, Any]:
-        if not url.startswith("https://"):
-            raise ValueError("MAX Webhook URL must use HTTPS")
+        try:
+            parsed = urlsplit(str(url).strip())
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("MAX Webhook URL is invalid") from exc
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or port not in (None, 443)
+        ):
+            raise ValueError("MAX Webhook URL must be public HTTPS on port 443")
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            address = None
+        if address is not None and not address.is_global:
+            raise ValueError("MAX Webhook URL must not point to a private or local address")
         if not _SECRET_PATTERN.fullmatch(secret):
             raise ValueError("MAX Webhook secret must match [A-Za-z0-9_-]{5,256}")
         body: dict[str, Any] = {"url": url, "secret": secret}

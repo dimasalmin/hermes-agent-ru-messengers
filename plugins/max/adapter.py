@@ -107,15 +107,19 @@ from .media import (
     is_allowed_outbound_media_url,
     media_type_for_file,
     mime_type_for_file,
+    validate_image_dimensions,
 )
 from .models import MaxCallback, MaxMessage
-from .polling_state import MaxTargetStore, PollingMarkerStore
+from .polling_state import MaxTargetStore, PollingMarkerStore, max_update_event_key
 from .rate_limit import MAX_MESSAGE_LENGTH, MaxRateLimiter, with_backoff
 from .rate_limit import MAX_ATTACHMENTS_PER_MESSAGE
 from .tls import tls_verify_from_env
 from .webhook import MaxWebhookReceiver, WebhookResult
 
 logger = logging.getLogger(__name__)
+UNSUPPORTED_AUDIO_FALLBACK_MESSAGE = (
+    "Аудиоформат не поддержан MAX; исходный файл отправлен как документ."
+)
 
 PLATFORM_NAME = "max"
 PLATFORM_LABEL = "MAX Messenger"
@@ -177,6 +181,25 @@ def _is_retryable_media_error(exc: BaseException) -> bool:
     return _is_media_send_retryable(exc) or bool(getattr(exc, "retryable", False))
 
 
+def _is_unsupported_audio_error(exc: MaxApiError) -> bool:
+    if exc.status_code == 415:
+        return True
+    details = f"{exc.code or ''} {exc}".lower().replace("_", " ").replace("-", " ")
+    return any(
+        marker in details
+        for marker in (
+            "file extension forbidden",
+            "file extension is forbidden",
+            "unsupported audio format",
+            "unsupported audio",
+            "unsupported media format",
+            "unsupported file type",
+            "unsupported format",
+            "invalid audio format",
+        )
+    )
+
+
 def _safe_https_url(value: str) -> bool:
     try:
         parsed = urlsplit(str(value).strip())
@@ -231,11 +254,43 @@ def _message_type(message: MaxMessage) -> Any:
 def _reply_message_id(link: Optional[Mapping[str, Any]]) -> Optional[str]:
     if not link:
         return None
-    for key in ("message", "message_id", "mid"):
+    for key in ("mid", "message_id"):
         value = link.get(key)
-        if value:
+        if isinstance(value, (str, int)) and value:
             return str(value)
+    linked_message = link.get("message") or link.get("linked_message")
+    if isinstance(linked_message, Mapping):
+        body = linked_message.get("body")
+        if isinstance(body, Mapping) and body.get("mid"):
+            return str(body["mid"])
+        for key in ("mid", "message_id"):
+            if linked_message.get(key):
+                return str(linked_message[key])
+    elif isinstance(linked_message, (str, int)) and linked_message:
+        return str(linked_message)
     return None
+
+
+def _is_reply_to_bot(
+    link: Optional[Mapping[str, Any]], bot_user_id: Optional[str]
+) -> bool:
+    if not link or not bot_user_id or str(link.get("type") or "").lower() != "reply":
+        return False
+    linked_message = link.get("message") or link.get("linked_message")
+    candidates = [link]
+    if isinstance(linked_message, Mapping):
+        candidates.append(linked_message)
+        body = linked_message.get("body")
+        if isinstance(body, Mapping):
+            candidates.append(body)
+    for candidate in candidates:
+        for sender_key in ("sender", "user", "author"):
+            sender = candidate.get(sender_key)
+            if not isinstance(sender, Mapping):
+                continue
+            if bool(sender.get("is_bot")) or str(sender.get("user_id") or "") == str(bot_user_id):
+                return True
+    return False
 
 
 def _reply_link(reply_to: Optional[str]) -> Optional[dict[str, str]]:
@@ -276,6 +331,7 @@ def _build_message_event(
     text: Optional[str] = None,
     media_urls: Optional[List[str]] = None,
     media_types: Optional[List[str]] = None,
+    update_event_key: Optional[str] = None,
 ) -> Any:
     """Translate a normalized MAX message through Hermes' public contract."""
 
@@ -306,6 +362,7 @@ def _build_message_event(
             "max_chat_id": message.chat_id,
             "max_target_type": "chat" if message.is_group else "user",
             "max_user_id": message.user_id,
+            **({"max_update_event_key": update_event_key} if update_event_key else {}),
         },
     )
 
@@ -431,7 +488,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._client: Optional[MaxClient] = None
         self._receiver: Optional[MaxWebhookReceiver] = None
         self._polling_task: Optional[asyncio.Task] = None
-        self._worker_task: Optional[asyncio.Task] = None
+        self._worker_tasks: list[asyncio.Task] = []
+        self._inbox_wakeup = asyncio.Event()
         self._bot_user_id: Optional[str] = None
         self._bot_username: Optional[str] = None
         self._chat_target_types: dict[str, str] = {}
@@ -452,6 +510,9 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         self._marker_store: Optional[PollingMarkerStore] = None
         self._target_store: Optional[MaxTargetStore] = None
         self._rate_limiter = MaxRateLimiter()
+        self._media_download_semaphore = asyncio.Semaphore(2)
+        self._chat_dispatch_locks: dict[str, asyncio.Lock] = {}
+        self._chat_media_download_locks: dict[str, asyncio.Lock] = {}
         try:
             callback_ttl = float(
                 self._extra.get(
@@ -506,16 +567,17 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     self._webhook_secret,
                     inbox_path=self._inbox_path,
                 )
+                await self._receiver.recover_inflight()
                 await self._client.subscribe_webhook(
                     self._webhook_url or "",
                     self._webhook_secret,
                     update_types=MAX_UPDATE_TYPES,
                 )
-                self._worker_task = asyncio.create_task(
-                    self._consume_webhook_queue(), name="max-webhook-worker"
-                )
+                self._start_inbox_workers("webhook")
             else:
                 self._marker_store = PollingMarkerStore(self._marker_path)
+                self._marker_store.recover_inflight()
+                self._start_inbox_workers("polling")
                 self._polling_task = asyncio.create_task(
                     self._poll_updates(), name="max-polling"
                 )
@@ -533,17 +595,20 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
     async def disconnect(self) -> None:
         self._running = False
-        for task in (self._polling_task, self._worker_task):
+        tasks = [self._polling_task, *self._worker_tasks]
+        for task in tasks:
             if task and not task.done():
                 task.cancel()
-        for task in (self._polling_task, self._worker_task):
+        for task in tasks:
             if task:
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
         self._polling_task = None
-        self._worker_task = None
+        self._worker_tasks.clear()
+        self._chat_dispatch_locks.clear()
+        self._chat_media_download_locks.clear()
         self._model_pickers.clear()
         if self._client is not None:
             await self._client.close()
@@ -652,20 +717,6 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         backoff = 1.0
         while self._running and self._client is not None:
             try:
-                if self._marker_store is not None:
-                    pending = self._marker_store.claim_next()
-                    if pending is not None:
-                        try:
-                            await self._dispatch_update(pending)
-                        except Exception as exc:  # noqa: BLE001
-                            self._marker_store.mark_failed(pending, str(exc))
-                            logger.exception(
-                                "MAX polling update moved to failed state; "
-                                "automatic replay is disabled"
-                            )
-                        else:
-                            self._marker_store.mark_processed(pending)
-                        continue
                 result = await self._client.get_updates(
                     marker=marker,
                     timeout=self._polling_timeout,
@@ -681,6 +732,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                         updates,
                         int(next_marker) if next_marker is not None else None,
                     )
+                    if updates:
+                        self._inbox_wakeup.set()
                 marker = int(next_marker) if next_marker is not None else marker
                 backoff = 1.0
                 if self._marker_store is None:
@@ -700,35 +753,78 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 await asyncio.sleep(min(backoff, 30.0))
                 backoff = min(backoff * 2.0, 30.0)
 
-    async def _consume_webhook_queue(self) -> None:
-        if self._receiver is None:
+    def _start_inbox_workers(self, transport: str) -> None:
+        self._worker_tasks = [
+            asyncio.create_task(
+                self._consume_durable_updates(control_only=True),
+                name=f"max-{transport}-control-worker",
+            ),
+            asyncio.create_task(
+                self._consume_durable_updates(control_only=False),
+                name=f"max-{transport}-media-worker-1",
+            ),
+            asyncio.create_task(
+                self._consume_durable_updates(control_only=False),
+                name=f"max-{transport}-media-worker-2",
+            ),
+        ]
+
+    async def _update_inbox(self, method_name: str, *args: Any) -> None:
+        store = self._receiver if self._webhook_mode else self._marker_store
+        if store is None:
             return
+        method = getattr(store, method_name, None)
+        if not callable(method):
+            return
+        result = method(*args)
+        if inspect.isawaitable(result):
+            await result
+
+    async def _consume_durable_updates(self, *, control_only: Optional[bool]) -> None:
         while self._running:
             try:
-                from_queue = True
+                self._inbox_wakeup.clear()
+                if self._receiver is not None:
+                    await self._receiver.drain_wakeup_queue()
+                    update = await self._receiver.claim_next(control_only=control_only)
+                elif self._marker_store is not None:
+                    update = self._marker_store.claim_next(control_only=control_only)
+                else:
+                    return
+                if update is None:
+                    try:
+                        await asyncio.wait_for(self._inbox_wakeup.wait(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
                 try:
-                    update = await asyncio.wait_for(self._receiver.get_queued(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    pending = await self._receiver.pending_updates(limit=1)
-                    if not pending:
-                        continue
-                    update = pending[0]
-                    from_queue = False
-                try:
-                    await self._receiver.mark_processing(update)
-                    await self._dispatch_update(update)
-                    await self._receiver.mark_processed(update)
-                except Exception:
-                    await self._receiver.mark_failed(update)
+                    disposition = await self._dispatch_update(update)
+                    if disposition == "accepted":
+                        await self._update_inbox("mark_accepted", update)
+                    elif disposition == "rejected":
+                        await self._update_inbox(
+                            "mark_failed", update, "Hermes не принял сообщение в очередь обработки"
+                        )
+                    else:
+                        await self._update_inbox("mark_processed", update)
+                except asyncio.CancelledError:
+                    await self._update_inbox("mark_unknown_key", max_update_event_key(update))
                     raise
-                finally:
-                    if from_queue:
-                        self._receiver.queue.task_done()
+                except Exception as exc:  # noqa: BLE001
+                    await self._update_inbox(
+                        "mark_failed", update, f"Ошибка обработки: {type(exc).__name__}: {exc}"
+                    )
+                    logger.exception("MAX update dispatch failed; automatic replay is disabled")
             except asyncio.CancelledError:
                 return
             except Exception:  # noqa: BLE001
-                logger.exception("MAX Webhook update processing failed")
+                logger.exception("MAX durable inbox worker failed")
                 await asyncio.sleep(1.0)
+
+    async def _consume_webhook_queue(self, *, control_only: Optional[bool] = None) -> None:
+        """Compatibility entry point for tests and deployments using the webhook inbox."""
+
+        await self._consume_durable_updates(control_only=control_only)
 
     async def handle_webhook(
         self, headers: Mapping[str, str], update: Mapping[str, Any]
@@ -741,12 +837,15 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
 
         if self._receiver is None:
             return WebhookResult(status_code=503, accepted=False)
-        return await self._receiver.receive(headers, update)
+        result = await self._receiver.receive(headers, update)
+        if result.durable and result.accepted:
+            self._inbox_wakeup.set()
+        return result
 
     async def _populate_message_media(self, message: MaxMessage, event: Any) -> None:
         """Download inbound MAX attachments into Hermes' local media cache."""
 
-        if self._client is None:
+        if getattr(self, "_client", None) is None:
             return
         for raw_attachment in message.attachments:
             attachment = attachment_from_payload(raw_attachment)
@@ -770,6 +869,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     media_url,
                     max_bytes=getattr(self, "_media_max_bytes", DEFAULT_MEDIA_MAX_BYTES),
                 )
+                if attachment.kind == "image":
+                    validate_image_dimensions(data, filename=attachment.filename)
                 cached = _cache_media_bytes(
                     data,
                     filename=attachment.filename,
@@ -809,54 +910,107 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             event.text = _append_event_note(event.text, cached.context_note())
             logger.info("MAX inbound media cached kind=%s", attachment.kind)
 
-    async def _dispatch_update(self, update: Mapping[str, Any]) -> None:
+    async def _download_media_for_chat(self, message: MaxMessage, event: Any) -> None:
+        lock = self._chat_media_download_locks.setdefault(message.chat_id, asyncio.Lock())
+        async with lock:
+            async with self._media_download_semaphore:
+                await self._populate_message_media(message, event)
+
+    async def _dispatch_update(self, update: Mapping[str, Any]) -> str:
         update_type = str(update.get("update_type") or "")
         if update_type == "bot_started":
             await self._dispatch_bot_started(update)
-            return
+            return "processed"
         if update_type in {"bot_stopped", "dialog_removed"}:
-            return
+            return "processed"
         callback = MaxCallback.from_update(update)
         if callback is not None:
             await self._dispatch_callback(callback)
-            return
+            return "processed"
 
         message = MaxMessage.from_update(update)
         if message is None:
-            return
+            return "processed"
         if self._bot_user_id and message.user_id == self._bot_user_id and message.is_bot:
-            return
+            return "processed"
 
         is_group = message.is_group
         target_type = "chat" if is_group else "user"
         self._chat_target_types[message.chat_id] = target_type
         if self._target_store is not None:
             self._target_store.set(message.chat_id, target_type)
-        mentioned = self._is_mentioned(message.text)
+        mentioned = self._is_mentioned(message.text) or _is_reply_to_bot(
+            message.link, self._bot_user_id
+        )
         if is_group:
             if not self._access.can_group(message.user_id, message.chat_id, mentioned=mentioned):
-                return
+                return "processed"
             if self._require_mention and not mentioned and not _is_command(message.text):
-                return
+                return "processed"
         elif not self._access.can_dm(message.user_id):
-            return
+            return "processed"
         if _is_command(message.text) and not self._access.can_run_command(
             message.user_id, message.text, is_group=is_group
         ):
-            return
+            return "processed"
         if is_group and _command_name(message.text) in GROUP_ADMIN_COMMANDS and not self._access.is_admin(message.user_id):
             await self.send(
                 message.chat_id,
                 "Эта управляющая команда доступна только администратору группы.",
                 metadata={"max_target_type": "chat", "max_user_id": message.user_id},
             )
-            return
+            return "processed"
         self._remember_group_user(message.chat_id, message.user_id, is_group=is_group)
         if await self._handle_local_command(message):
+            return "processed"
+        event = _build_message_event(
+            self,
+            message,
+            update_event_key=max_update_event_key(update),
+        )
+
+        async def _deliver_to_hermes() -> None:
+            if message.attachments:
+                await self._download_media_for_chat(message, event)
+            await self.handle_message(event)
+
+        if _is_command(message.text):
+            await _deliver_to_hermes()
+        else:
+            session_chat_id = (
+                f"{message.chat_id}{GROUP_SESSION_SEPARATOR}{message.user_id}"
+                if message.is_group
+                else message.chat_id
+            )
+            lock = self._chat_dispatch_locks.setdefault(session_chat_id, asyncio.Lock())
+            async with lock:
+                await _deliver_to_hermes()
+        return "accepted" if getattr(event, "_gateway_accepted", False) else "rejected"
+
+    async def on_processing_start(self, event: Any) -> None:
+        metadata = getattr(event, "metadata", None) or {}
+        event_key = metadata.get("max_update_event_key") if isinstance(metadata, Mapping) else None
+        if event_key:
+            await self._update_inbox("mark_processing_key", str(event_key))
+
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        metadata = getattr(event, "metadata", None) or {}
+        event_key = metadata.get("max_update_event_key") if isinstance(metadata, Mapping) else None
+        if not event_key:
             return
-        event = _build_message_event(self, message)
-        await self._populate_message_media(message, event)
-        await self.handle_message(event)
+        name = str(
+            getattr(outcome, "name", None)
+            or getattr(outcome, "value", None)
+            or outcome
+        ).lower()
+        if "success" in name:
+            await self._update_inbox("mark_processed_key", str(event_key))
+        elif "cancel" in name:
+            await self._update_inbox("mark_unknown_key", str(event_key))
+        else:
+            await self._update_inbox(
+                "mark_failed_key", str(event_key), "Hermes обработал сообщение с ошибкой"
+            )
 
     async def _dispatch_bot_started(self, update: Mapping[str, Any]) -> None:
         user = update.get("user") if isinstance(update.get("user"), Mapping) else {}
@@ -1213,8 +1367,11 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         elif self._receiver is not None:
             summary = self._receiver.status_summary()
         pending = int(summary.get("pending", 0) or 0)
+        dispatching = int(summary.get("dispatching", 0) or 0)
+        accepted = int(summary.get("accepted", 0) or 0)
         processing = int(summary.get("processing", 0) or 0)
         failed = int(summary.get("failed", 0) or 0)
+        unknown = int(summary.get("unknown", 0) or 0)
         last_error = str(summary.get("last_error") or "")
         error_category = "нет"
         if last_error:
@@ -1232,7 +1389,8 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         return (
             "**MAX: диагностика**\n\n"
             f"Транспорт: `{transport}`\n"
-            f"Очередь: pending={pending}, processing={processing}, failed={failed}\n"
+            f"Очередь: pending={pending}, dispatching={dispatching}, accepted={accepted}, "
+            f"processing={processing}, failed={failed}, unknown={unknown}\n"
             f"Последняя категория ошибки: `{error_category}`\n"
             "Повторная обработка неоднозначных событий автоматически не выполняется."
         )
@@ -1392,6 +1550,70 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return None
         return str(path) if path.is_file() else None
 
+    async def _send_attachment_with_caption(
+        self,
+        chat_id: str,
+        attachment: Mapping[str, Any],
+        *,
+        caption: Optional[str],
+        reply_to: Optional[str],
+        metadata: Optional[Mapping[str, Any]],
+    ) -> Any:
+        transport_chat_id = _transport_chat_id(chat_id, metadata)
+        target_type = self._target_type_for(transport_chat_id, metadata)
+        chunks = split_message(str(caption or ""), MAX_MESSAGE_LENGTH) if caption else [""]
+        message_ids: list[str] = []
+        errors: list[str] = []
+        unsupported_audio_rejected = False
+        attachment_type = str(attachment.get("type") or "").strip().lower()
+        for index, chunk in enumerate(chunks):
+            await self._rate_limiter.acquire(transport_chat_id)
+            kwargs: dict[str, Any] = {"target_type": target_type}
+            if index == 0:
+                kwargs["link"] = _reply_link(reply_to)
+                kwargs["attachments"] = [attachment]
+            try:
+                response = await with_backoff(
+                    lambda: self._client.send_message(transport_chat_id, chunk, **kwargs),
+                    is_rate_limit=_is_media_send_retryable if index == 0 else _is_max_rate_limit,
+                    extract_retry_after=_media_retry_after if index == 0 else _retry_after,
+                    max_attempts=5,
+                )
+            except MaxApiError as exc:
+                errors.append(str(exc))
+                if index == 0:
+                    unsupported_audio_rejected = (
+                        attachment_type == "audio" and _is_unsupported_audio_error(exc)
+                    )
+                    # The first request carries the attachment. Do not emit
+                    # later caption chunks as though the attachment succeeded.
+                    break
+                continue
+            message_id = _response_message_id(response)
+            if message_id:
+                message_ids.append(message_id)
+
+        if errors and not message_ids:
+            return SendResult(
+                success=False,
+                error="; ".join(errors),
+                error_kind=(
+                    "unsupported_audio_format"
+                    if unsupported_audio_rejected
+                    else "media_send"
+                ),
+            )
+        result = _send_result_from_ids(message_ids)
+        if errors:
+            return SendResult(
+                success=False,
+                message_id=getattr(result, "message_id", None),
+                continuation_message_ids=getattr(result, "continuation_message_ids", ()),
+                error="Подпись доставлена не полностью: " + "; ".join(errors),
+                error_kind="partial_media",
+            )
+        return result
+
     async def _send_local_attachment(
         self,
         chat_id: str,
@@ -1406,7 +1628,6 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
     ) -> Any:
         if self._client is None:
             return SendResult(success=False, error="MAX adapter is not connected")
-        transport_chat_id = _transport_chat_id(chat_id, metadata)
         safe_path = self._validated_media_path(file_path)
         if not safe_path:
             return SendResult(success=False, error="MAX attachment path is not allowed")
@@ -1432,40 +1653,61 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             token = str(upload.get("token") or "").strip()
             if not token:
                 raise MaxApiError("MAX media upload returned no attachment token")
-            target_type = self._target_type_for(transport_chat_id, metadata)
             attachment = {
                 "type": actual_type,
                 "payload": {"token": token},
             }
-            await self._rate_limiter.acquire(transport_chat_id)
-
-            async def _send() -> Mapping[str, Any]:
-                return await self._client.send_message(
-                    transport_chat_id,
-                    str(caption or "")[:MAX_MESSAGE_LENGTH],
-                    target_type=target_type,
-                    link=_reply_link(reply_to),
-                    attachments=[attachment],
-                )
-
-            response = await with_backoff(
-                _send,
-                is_rate_limit=_is_media_send_retryable,
-                extract_retry_after=_media_retry_after,
-                max_attempts=5,
+            result = await self._send_attachment_with_caption(
+                chat_id,
+                attachment,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
             )
+            if (
+                actual_type == "audio"
+                and not result.success
+                and getattr(result, "error_kind", None) == "unsupported_audio_format"
+            ):
+                fallback_caption = (
+                    f"{caption}\n\n{UNSUPPORTED_AUDIO_FALLBACK_MESSAGE}"
+                    if caption
+                    else UNSUPPORTED_AUDIO_FALLBACK_MESSAGE
+                )
+                return await self._send_local_attachment(
+                    chat_id,
+                    safe_path,
+                    media_type="file",
+                    caption=fallback_caption,
+                    file_name=file_name,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    force_document=True,
+                )
+            return result
         except (MaxApiError, OSError, ValueError) as exc:
+            if actual_type == "audio" and isinstance(exc, MaxApiError) and _is_unsupported_audio_error(exc):
+                fallback_caption = (
+                    f"{caption}\n\n{UNSUPPORTED_AUDIO_FALLBACK_MESSAGE}"
+                    if caption
+                    else UNSUPPORTED_AUDIO_FALLBACK_MESSAGE
+                )
+                return await self._send_local_attachment(
+                    chat_id,
+                    safe_path,
+                    media_type="file",
+                    caption=fallback_caption,
+                    file_name=file_name,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    force_document=True,
+                )
             return SendResult(
                 success=False,
                 error=str(exc),
                 retryable=bool(getattr(exc, "retryable", False)),
                 retry_after=getattr(exc, "retry_after", None),
             )
-        return SendResult(
-            success=True,
-            message_id=_response_message_id(response),
-            raw_response=response,
-        )
 
     async def _send_remote_image(
         self,
@@ -1480,8 +1722,6 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             return SendResult(success=False, error="MAX image URL is not allowed")
         if self._client is None:
             return SendResult(success=False, error="MAX adapter is not connected")
-        transport_chat_id = _transport_chat_id(chat_id, metadata)
-        target_type = self._target_type_for(transport_chat_id, metadata)
         try:
             data, remote_mime = await self._client.download_media(
                 image_url,
@@ -1505,22 +1745,12 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             if not token:
                 raise MaxApiError("MAX media upload returned no attachment token")
             attachment = {"type": "image", "payload": {"token": token}}
-            await self._rate_limiter.acquire(transport_chat_id)
-
-            async def _send() -> Mapping[str, Any]:
-                return await self._client.send_message(
-                    transport_chat_id,
-                    str(caption or "")[:MAX_MESSAGE_LENGTH],
-                    target_type=target_type,
-                    link=_reply_link(reply_to),
-                    attachments=[attachment],
-                )
-
-            response = await with_backoff(
-                _send,
-                is_rate_limit=_is_media_send_retryable,
-                extract_retry_after=_media_retry_after,
-                max_attempts=5,
+            return await self._send_attachment_with_caption(
+                chat_id,
+                attachment,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
             )
         except (MaxApiError, OSError, ValueError) as exc:
             return SendResult(
@@ -1529,7 +1759,6 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 retryable=bool(getattr(exc, "retryable", False)),
                 retry_after=getattr(exc, "retry_after", None),
             )
-        return SendResult(success=True, message_id=_response_message_id(response), raw_response=response)
 
     async def send_image(
         self,
@@ -1661,23 +1890,82 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
         images: list[tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> Any:
         if len(images) > MAX_ATTACHMENTS_PER_MESSAGE:
             logger.info(
                 "MAX image batch has %d items; sending in separate messages",
                 len(images),
             )
-        for image_url, alt_text in images:
+        message_ids: list[str] = []
+        failures: list[dict[str, Any]] = []
+        delivered = 0
+        for index, (image_url, alt_text) in enumerate(images, start=1):
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
-            result = await self.send_image(
+            try:
+                result = await self.send_image(
+                    chat_id,
+                    image_url,
+                    caption=alt_text or None,
+                    metadata=metadata,
+                )
+            except Exception as exc:  # noqa: BLE001 - continue the remaining image batch
+                failures.append({"index": index, "error": f"{type(exc).__name__}: {exc}"})
+                logger.warning("MAX image delivery failed at item %d: %s", index, exc)
+                continue
+            if getattr(result, "success", False):
+                delivered += 1
+                message_id = getattr(result, "message_id", None)
+                if message_id:
+                    message_ids.extend(
+                        str(item)
+                        for item in getattr(result, "continuation_message_ids", ())
+                        if item
+                    )
+                    message_ids.append(str(message_id))
+            else:
+                error = str(getattr(result, "error", "MAX image delivery failed"))
+                failures.append({"index": index, "error": error})
+                logger.warning("MAX image delivery failed: %s", getattr(result, "error", result))
+        if not delivered:
+            if failures:
+                await self._notify_media_delivery_issue(
+                    chat_id,
+                    "Не удалось доставить изображения "
+                    + ", ".join(f"№{item['index']}" for item in failures)
+                    + ".",
+                    metadata=metadata,
+                )
+            return SendResult(
+                success=False,
+                error="; ".join(item["error"] for item in failures) or "MAX image list is empty",
+                raw_response={"delivered": 0, "failed_images": failures},
+                error_kind="media_send",
+            )
+        result = _send_result_from_ids(message_ids)
+        if failures:
+            await self._notify_media_delivery_issue(
                 chat_id,
-                image_url,
-                caption=alt_text or None,
+                "Не удалось доставить изображения "
+                + ", ".join(f"№{item['index']}" for item in failures)
+                + ". Остальные изображения отправлены.",
                 metadata=metadata,
             )
-            if not getattr(result, "success", False):
-                logger.warning("MAX image delivery failed: %s", getattr(result, "error", result))
+            return SendResult(
+                success=True,
+                message_id=getattr(result, "message_id", None),
+                continuation_message_ids=getattr(result, "continuation_message_ids", ()),
+                error="Часть изображений не доставлена: "
+                + "; ".join(f"#{item['index']}: {item['error']}" for item in failures),
+                raw_response={"delivered": delivered, "failed_images": failures},
+                error_kind="partial_media",
+            )
+        return SendResult(
+            success=True,
+            message_id=getattr(result, "message_id", None),
+            continuation_message_ids=getattr(result, "continuation_message_ids", ()),
+            raw_response={"delivered": delivered, "failed_images": []},
+        )
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         transport_chat_id = _transport_chat_id(chat_id, metadata)
@@ -1782,6 +2070,22 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             logger.exception("MAX outbound media extraction failed")
             return [], content
 
+    async def _notify_media_delivery_issue(
+        self,
+        chat_id: str,
+        notice: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if getattr(self, "_client", None) is None:
+            return
+        try:
+            result = await self.send(chat_id, notice, metadata=metadata)
+            if not getattr(result, "success", False):
+                logger.warning("MAX media delivery notice was not delivered")
+        except Exception:  # noqa: BLE001 - preserve the original media result
+            logger.exception("MAX media delivery notice failed")
+
     async def _send_media_files(
         self,
         chat_id: str,
@@ -1834,6 +2138,12 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                 upload_errors.append(str(exc))
 
         if not attachments:
+            if upload_errors:
+                await self._notify_media_delivery_issue(
+                    chat_id,
+                    f"Не удалось загрузить ни одно из {len(media_files)} вложений.",
+                    metadata=metadata,
+                )
             return SendResult(
                 success=False,
                 error="; ".join(upload_errors) or "MAX media uploads failed",
@@ -1897,6 +2207,13 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
                     message_ids.append(message_id)
 
         if not message_ids:
+            if upload_errors or send_errors:
+                await self._notify_media_delivery_issue(
+                    chat_id,
+                    f"Не удалось доставить вложения ({len(upload_errors)} ошибок загрузки, "
+                    f"{len(send_errors)} ошибок отправки).",
+                    metadata=metadata,
+                )
             return SendResult(
                 success=False,
                 error="; ".join(upload_errors + send_errors)
@@ -1905,6 +2222,12 @@ class MaxAdapter(BasePlatformAdapter):  # type: ignore[misc]
             )
         result = _send_result_from_ids(message_ids)
         if upload_errors or send_errors:
+            await self._notify_media_delivery_issue(
+                chat_id,
+                f"Часть вложений не доставлена ({len(upload_errors)} ошибок загрузки, "
+                f"{len(send_errors)} ошибок отправки). Остальные отправлены.",
+                metadata=metadata,
+            )
             return SendResult(
                 success=False,
                 message_id=getattr(result, "message_id", None),
@@ -2351,6 +2674,22 @@ async def standalone_send(
             attachments: list[Mapping[str, Any]] = []
             raw_media_files = list(media_files or [])
             upload_errors: list[str] = []
+            audio_sources: dict[str, str] = {}
+            audio_fallback_used = False
+
+            async def upload_attachment(path: str, attachment_type: str) -> Mapping[str, Any]:
+                return await with_backoff(
+                    lambda: client.upload_media(
+                        path,
+                        media_type=attachment_type,
+                        max_bytes=media_max_bytes,
+                        mime_type=mime_type_for_file(path, attachment_type),
+                    ),
+                    is_rate_limit=_is_retryable_media_error,
+                    extract_retry_after=_media_retry_after,
+                    max_attempts=5,
+                )
+
             for media_path in raw_media_files:
                 if isinstance(media_path, (tuple, list)):
                     path = str(media_path[0])
@@ -2369,47 +2708,96 @@ async def standalone_send(
                 if is_voice and not force_document:
                     media_type = media_type_for_file(path, is_voice=True)
                 try:
-                    upload = await with_backoff(
-                        lambda: client.upload_media(
-                            safe_path,
-                            media_type=media_type,
-                            max_bytes=media_max_bytes,
-                            mime_type=mime_type_for_file(safe_path, media_type),
-                        ),
-                        is_rate_limit=_is_retryable_media_error,
-                        extract_retry_after=_media_retry_after,
-                        max_attempts=5,
-                    )
+                    upload = await upload_attachment(safe_path, media_type)
                     token_value = str(upload.get("token") or "").strip()
                     if not token_value:
                         raise MaxApiError("MAX media upload returned no attachment token")
                     attachments.append({"type": media_type, "payload": {"token": token_value}})
-                except (MaxApiError, OSError, TypeError, ValueError) as exc:
+                    if media_type == "audio":
+                        audio_sources[token_value] = safe_path
+                except MaxApiError as exc:
+                    if media_type != "audio" or not _is_unsupported_audio_error(exc):
+                        upload_errors.append(str(exc))
+                        continue
+                    try:
+                        upload = await upload_attachment(safe_path, "file")
+                        token_value = str(upload.get("token") or "").strip()
+                        if not token_value:
+                            raise MaxApiError("MAX media upload returned no attachment token")
+                        attachments.append({"type": "file", "payload": {"token": token_value}})
+                        audio_fallback_used = True
+                    except (MaxApiError, OSError, TypeError, ValueError) as fallback_exc:
+                        upload_errors.append(str(fallback_exc))
+                except (OSError, TypeError, ValueError) as exc:
                     upload_errors.append(str(exc))
-            if not attachments:
+            chunks = split_message(message, MAX_MESSAGE_LENGTH) if message else []
+            batches = _attachment_batches(attachments) if attachments else ([[]] if chunks else [])
+            if not batches:
                 return {"error": "; ".join(upload_errors) or "MAX media uploads failed"}
 
-            last_id = None
+            message_ids: list[str] = []
             send_errors: list[str] = []
-            chunks = split_message(message, MAX_MESSAGE_LENGTH) if message else [""]
-            for batch_index, batch in enumerate(_attachment_batches(attachments)):
-                chunk = chunks[0] if batch_index == 0 else ""
+            sent_count = 0
+            for batch_index, batch in enumerate(batches):
+                chunk = chunks[0] if batch_index == 0 and chunks else ""
                 try:
+                    request = lambda: client.send_message(
+                        str(chat_id),
+                        chunk,
+                        target_type=target_type,
+                        **({"attachments": batch} if batch else {}),
+                    )
                     response = await with_backoff(
-                        lambda: client.send_message(
-                            str(chat_id),
-                            chunk,
-                            target_type=target_type,
-                            attachments=batch,
-                        ),
+                        request,
                         is_rate_limit=_is_media_send_retryable,
                         extract_retry_after=_media_retry_after,
                         max_attempts=5,
                     )
-                    last_id = _response_message_id(response) or last_id
+                    sent_count += 1
+                    message_id = _response_message_id(response)
+                    if message_id:
+                        message_ids.append(message_id)
                 except MaxApiError as exc:
+                    if (
+                        len(batch) == 1
+                        and str(batch[0].get("type") or "").lower() == "audio"
+                        and _is_unsupported_audio_error(exc)
+                    ):
+                        audio_token = str(
+                            (batch[0].get("payload") or {}).get("token") or ""
+                        )
+                        source_path = audio_sources.get(audio_token)
+                        if source_path:
+                            try:
+                                upload = await upload_attachment(source_path, "file")
+                                token_value = str(upload.get("token") or "").strip()
+                                if not token_value:
+                                    raise MaxApiError(
+                                        "MAX media upload returned no attachment token"
+                                    )
+                                document = {"type": "file", "payload": {"token": token_value}}
+                                response = await with_backoff(
+                                    lambda: client.send_message(
+                                        str(chat_id),
+                                        chunk,
+                                        target_type=target_type,
+                                        attachments=[document],
+                                    ),
+                                    is_rate_limit=_is_media_send_retryable,
+                                    extract_retry_after=_media_retry_after,
+                                    max_attempts=5,
+                                )
+                                sent_count += 1
+                                message_id = _response_message_id(response)
+                                if message_id:
+                                    message_ids.append(message_id)
+                                audio_fallback_used = True
+                                continue
+                            except (MaxApiError, OSError, TypeError, ValueError) as fallback_exc:
+                                send_errors.append(str(fallback_exc))
+                                continue
                     send_errors.append(str(exc))
-            if last_id:
+            if sent_count and chunks:
                 for chunk in chunks[1:]:
                     try:
                         response = await with_backoff(
@@ -2420,17 +2808,39 @@ async def standalone_send(
                             extract_retry_after=_media_retry_after,
                             max_attempts=5,
                         )
-                        last_id = _response_message_id(response) or last_id
+                        sent_count += 1
+                        message_id = _response_message_id(response)
+                        if message_id:
+                            message_ids.append(message_id)
                     except MaxApiError as exc:
                         send_errors.append(str(exc))
+            if audio_fallback_used:
+                try:
+                    response = await with_backoff(
+                        lambda: client.send_message(
+                            str(chat_id),
+                            UNSUPPORTED_AUDIO_FALLBACK_MESSAGE,
+                            target_type=target_type,
+                        ),
+                        is_rate_limit=_is_max_rate_limit,
+                        extract_retry_after=_retry_after,
+                        max_attempts=5,
+                    )
+                    sent_count += 1
+                    message_id = _response_message_id(response)
+                    if message_id:
+                        message_ids.append(message_id)
+                except MaxApiError as exc:
+                    send_errors.append(str(exc))
             errors = upload_errors + send_errors
-            if not last_id:
+            if not sent_count:
                 return {"error": "; ".join(errors) or "MAX media messages failed"}
             result = {
                 "success": not errors,
                 "platform": PLATFORM_NAME,
                 "chat_id": str(chat_id),
-                "message_id": last_id,
+                "message_id": message_ids[-1] if message_ids else None,
+                "continuation_message_ids": message_ids[:-1],
             }
             if errors:
                 result["error"] = "Часть вложений не доставлена: " + "; ".join(errors)

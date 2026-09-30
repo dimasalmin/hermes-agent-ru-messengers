@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import pytest
 import httpx
+from io import BytesIO
 from types import SimpleNamespace
+from PIL import Image
 
 import plugins.max.adapter as max_adapter_module
 from plugins.max.adapter import _build_message_event
 from plugins.max.adapter import standalone_send
-from plugins.max.client import MaxClient
+from plugins.max.client import DEFAULT_MEDIA_MAX_BYTES, MaxApiError, MaxClient
+from plugins.max.rate_limit import MAX_ATTACHMENT_SIZE
 from plugins.max.models import MaxMessage
 from plugins.max.media import (
     MaxAttachment,
@@ -15,7 +18,14 @@ from plugins.max.media import (
     is_allowed_media_url,
     media_type_for_file,
     mime_type_for_file,
+    validate_image_dimensions,
 )
+
+
+def _png_bytes(width: int = 1, height: int = 1) -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (width, height)).save(output, format="PNG")
+    return output.getvalue()
 
 
 def test_attachment_from_payload_extracts_nested_url_and_filename() -> None:
@@ -80,6 +90,67 @@ def test_attachment_from_payload_uses_safe_url_basename() -> None:
 
 def test_attachment_from_payload_ignores_unsupported_types() -> None:
     assert attachment_from_payload({"type": "sticker", "payload": {}}) is None
+
+
+def test_max_media_limit_is_exactly_50_million_bytes() -> None:
+    assert DEFAULT_MEDIA_MAX_BYTES == 50_000_000
+    assert MAX_ATTACHMENT_SIZE == 50_000_000
+
+
+def test_image_dimensions_enforce_max_side_length() -> None:
+    assert validate_image_dimensions(_png_bytes(7680, 1)) == (7680, 1)
+    with pytest.raises(ValueError, match="7680"):
+        validate_image_dimensions(_png_bytes(7681, 1))
+
+
+def test_heic_dimensions_when_heif_support_is_installed() -> None:
+    pytest.importorskip("pillow_heif")
+    output = BytesIO()
+    Image.new("RGB", (320, 240)).save(output, format="HEIF")
+    assert validate_image_dimensions(output.getvalue(), filename="sample.heic") == (320, 240)
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_file_over_default_limit_before_api_request(tmp_path) -> None:
+    class _Client(MaxClient):
+        def __init__(self) -> None:
+            self.requested = False
+
+        async def _request(self, *args, **kwargs):
+            self.requested = True
+            raise AssertionError("oversized file must be rejected before API request")
+
+    path = tmp_path / "oversize.bin"
+    with path.open("wb") as file_obj:
+        file_obj.truncate(DEFAULT_MEDIA_MAX_BYTES + 1)
+
+    client = _Client()
+    with pytest.raises(MaxApiError, match="exceeds configured size limit"):
+        await client.upload_media(
+            path,
+            media_type="file",
+            max_bytes=DEFAULT_MEDIA_MAX_BYTES + 100,
+        )
+    assert client.requested is False
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_oversized_image_dimensions_before_api_request(tmp_path) -> None:
+    class _Client(MaxClient):
+        def __init__(self) -> None:
+            self.requested = False
+
+        async def _request(self, *args, **kwargs):
+            self.requested = True
+            raise AssertionError("invalid image must be rejected before API request")
+
+    path = tmp_path / "wide.png"
+    path.write_bytes(_png_bytes(7681, 1))
+    client = _Client()
+
+    with pytest.raises(MaxApiError, match="dimensions"):
+        await client.upload_media(path, media_type="image")
+    assert client.requested is False
 
 
 @pytest.mark.parametrize(
@@ -206,7 +277,7 @@ async def test_adapter_caches_incoming_media_into_hermes_event(monkeypatch) -> N
         async def download_media(self, url: str, *, max_bytes: int):
             assert url == "https://iu.oneme.ru/photo.png"
             assert max_bytes == 1024
-            return b"image-bytes", "image/png"
+            return _png_bytes(), "image/png"
 
     cached = type(
         "Cached",
@@ -245,6 +316,205 @@ async def test_adapter_caches_incoming_media_into_hermes_event(monkeypatch) -> N
     assert event.media_urls == ["/home/xidden/.hermes/cache/images/max.png"]
     assert event.media_types == ["image/png"]
     assert "saved at" in event.text
+
+
+@pytest.mark.asyncio
+async def test_adapter_rejects_inbound_image_over_dimension_limit(monkeypatch) -> None:
+    class _Client:
+        async def download_media(self, url: str, *, max_bytes: int):
+            return _png_bytes(7681, 1), "image/png"
+
+    cached = False
+
+    def cache_media(*args, **kwargs):
+        nonlocal cached
+        cached = True
+        raise AssertionError("oversized image must not enter Hermes cache")
+
+    monkeypatch.setattr(max_adapter_module, "_cache_media_bytes", cache_media)
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    adapter._client = _Client()
+    adapter._media_max_bytes = 1024
+    adapter.platform = "max"
+    message = MaxMessage(
+        message_id="mid-wide-image",
+        user_id="user-1",
+        user_name="User",
+        chat_id="user-1",
+        chat_type="dialog",
+        chat_title=None,
+        text="Посмотри",
+        attachments=(
+            {
+                "type": "image",
+                "payload": {"url": "https://iu.oneme.ru/wide.png", "filename": "wide.png"},
+            },
+        ),
+    )
+    event = _build_message_event(adapter, message)
+
+    await adapter._populate_message_media(message, event)
+
+    assert cached is False
+    assert event.media_urls == []
+    assert "не удалось скачать" in event.text
+
+
+@pytest.mark.asyncio
+async def test_unsupported_audio_is_sent_unchanged_as_document(tmp_path) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.upload_types = []
+            self.messages = []
+
+        async def upload_media(self, path, *, media_type, **kwargs):
+            self.upload_types.append(media_type)
+            if media_type == "audio":
+                raise MaxApiError(
+                    "Audio upload rejected",
+                    code="file_extension_forbidden",
+                    status_code=400,
+                )
+            return {"token": "document-token"}
+
+        async def send_message(self, target_id, text, **kwargs):
+            self.messages.append((target_id, text, kwargs))
+            return {"message": {"body": {"mid": "document-mid"}}}
+
+    audio_path = tmp_path / "original.wav"
+    audio_path.write_bytes(b"original audio bytes")
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    adapter._client = _Client()
+    adapter._media_max_bytes = 1024
+    adapter._chat_target_types = {"user-1": "user"}
+    adapter._rate_limiter = max_adapter_module.MaxRateLimiter()
+    adapter.validate_media_delivery_path = lambda path: str(path)
+
+    result = await adapter.send_voice("user-1", str(audio_path), caption="Речь")
+
+    assert result.success is True
+    assert adapter._client.upload_types == ["audio", "file"]
+    sent = adapter._client.messages[0]
+    assert sent[2]["attachments"] == [{"type": "file", "payload": {"token": "document-token"}}]
+    assert sent[1] == "Речь\n\nАудиоформат не поддержан MAX; исходный файл отправлен как документ."
+
+
+@pytest.mark.asyncio
+async def test_audio_send_rejection_falls_back_to_document_without_losing_caption(tmp_path) -> None:
+    class _Client:
+        def __init__(self) -> None:
+            self.upload_types = []
+            self.attempts = []
+
+        async def upload_media(self, path, *, media_type, **kwargs):
+            del path, kwargs
+            self.upload_types.append(media_type)
+            return {"token": f"{media_type}-token"}
+
+        async def send_message(self, target_id, text, **kwargs):
+            self.attempts.append((target_id, text, kwargs))
+            attachments = kwargs.get("attachments", [])
+            if attachments and attachments[0]["type"] == "audio":
+                raise MaxApiError(
+                    "Audio format rejected",
+                    code="unsupported_audio_format",
+                    status_code=415,
+                )
+            return {"message": {"body": {"mid": f"mid-{len(self.attempts)}"}}}
+
+    audio_path = tmp_path / "recording.wav"
+    audio_path.write_bytes(b"original audio bytes")
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    adapter._client = _Client()
+    adapter._media_max_bytes = 1024
+    adapter._chat_target_types = {"user-1": "user"}
+    adapter._rate_limiter = max_adapter_module.MaxRateLimiter()
+    adapter.validate_media_delivery_path = lambda path: str(path)
+    caption = "Проверка " + ("длинной подписи " * 300)
+
+    result = await adapter.send_voice("user-1", str(audio_path), caption=caption)
+
+    assert result.success is True
+    assert adapter._client.upload_types == ["audio", "file"]
+    accepted = [
+        call for call in adapter._client.attempts
+        if not call[2].get("attachments")
+        or call[2]["attachments"][0]["type"] == "file"
+    ]
+    assert accepted[0][2]["attachments"] == [
+        {"type": "file", "payload": {"token": "file-token"}}
+    ]
+    assert "Проверка" in "".join(call[1] for call in accepted)
+    assert "Аудиоформат не поддержан MAX" in "".join(call[1] for call in accepted)
+    assert "Аудиоформат не поддержан MAX" not in adapter._client.attempts[1][1]
+
+
+@pytest.mark.parametrize("reject_at", ["upload", "send"])
+@pytest.mark.asyncio
+async def test_standalone_audio_falls_back_to_document(monkeypatch, tmp_path, reject_at) -> None:
+    class _Client:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.upload_types = []
+            self.attempts = []
+            self.__class__.instances.append(self)
+
+        async def upload_media(self, path, *, media_type, **kwargs):
+            del path, kwargs
+            self.upload_types.append(media_type)
+            if reject_at == "upload" and media_type == "audio":
+                raise MaxApiError(
+                    "Audio format rejected",
+                    code="file_extension_forbidden",
+                    status_code=400,
+                )
+            return {"token": f"{media_type}-token"}
+
+        async def send_message(self, target_id, text, **kwargs):
+            self.attempts.append((target_id, text, kwargs))
+            attachments = kwargs.get("attachments", [])
+            if reject_at == "send" and attachments and attachments[0]["type"] == "audio":
+                raise MaxApiError(
+                    "Audio format rejected",
+                    code="unsupported_audio_format",
+                    status_code=415,
+                )
+            return {"message": {"body": {"mid": f"cron-{len(self.attempts)}"}}}
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(max_adapter_module, "MaxClient", _Client)
+    config = SimpleNamespace(
+        token="test-token",
+        extra={"target_path": str(tmp_path / "targets.sqlite3"), "media_max_bytes": 1024},
+    )
+    audio_path = tmp_path / "voice.ogg"
+    audio_path.write_bytes(b"original audio bytes")
+
+    result = await standalone_send(
+        config,
+        "user-1",
+        "Голосовое сообщение",
+        media_files=[(str(audio_path), True)],
+    )
+
+    assert result["success"] is True
+    client = _Client.instances[0]
+    assert client.upload_types == ["audio", "file"]
+    document_send = next(
+        call for call in client.attempts
+        if call[2].get("attachments", [{}])[0].get("type") == "file"
+    )
+    assert document_send[2]["attachments"] == [
+        {"type": "file", "payload": {"token": "file-token"}}
+    ]
+    assert any(
+        "Аудиоформат не поддержан MAX" in call[1]
+        for call in client.attempts
+    )
 
 
 @pytest.mark.asyncio
@@ -501,6 +771,159 @@ async def test_standalone_sender_delivers_media_files(monkeypatch, tmp_path) -> 
     assert _Client.sent[0][2]["attachments"] == [
         {"type": "file", "payload": {"token": "cron-token"}}
     ]
+
+
+@pytest.mark.asyncio
+async def test_standalone_sender_delivers_text_without_media(monkeypatch, tmp_path) -> None:
+    class _Client:
+        sent = []
+
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        async def send_message(self, target_id, text, **kwargs):
+            self.sent.append((target_id, text, kwargs))
+            return {"message": {"body": {"mid": "cron-text-mid"}}}
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr(max_adapter_module, "MaxClient", _Client)
+    config = SimpleNamespace(token="secret-token", extra={"target_path": str(tmp_path / "targets.sqlite3")})
+
+    result = await standalone_send(config, "user-1", "Плановое уведомление")
+
+    assert result["success"] is True
+    assert _Client.sent == [("user-1", "Плановое уведомление", {"target_type": "user"})]
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_returns_aggregate_send_result() -> None:
+    from plugins.max.adapter import SendResult
+
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    calls = []
+
+    class _Client:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_message(self, chat_id, text, **kwargs):
+            self.sent.append((chat_id, text, kwargs))
+            return {"message": {"body": {"mid": "notice-mid"}}}
+
+    adapter._client = _Client()
+    adapter._chat_target_types = {"user-1": "user"}
+    adapter._rate_limiter = max_adapter_module.MaxRateLimiter()
+
+    async def send_image(chat_id, image_url, **kwargs):
+        calls.append(image_url)
+        if image_url.endswith("failed.png"):
+            return SendResult(success=False, error="upload failed")
+        return SendResult(success=True, message_id=f"mid-{len(calls)}")
+
+    adapter.send_image = send_image
+
+    result = await adapter.send_multiple_images(
+        "user-1",
+        [
+            ("https://img.example/one.png", "one"),
+            ("https://img.example/failed.png", "bad"),
+            ("https://img.example/two.png", "two"),
+        ],
+    )
+
+    assert result.success is True
+    assert result.message_id == "mid-3"
+    assert result.continuation_message_ids == ("mid-1",)
+    assert result.raw_response["failed_images"][0]["index"] == 2
+    assert adapter._client.sent[0][1] == "Не удалось доставить изображения №2. Остальные изображения отправлены."
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_continues_after_unexpected_error() -> None:
+    from plugins.max.adapter import SendResult
+
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    calls = 0
+
+    async def send_image(chat_id, image_url, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic error")
+        return SendResult(success=True, message_id="delivered")
+
+    adapter.send_image = send_image
+    result = await adapter.send_multiple_images(
+        "user-1", [("https://img.example/fail.png", ""), ("https://img.example/ok.png", "")]
+    )
+
+    assert result.success is True
+    assert result.message_id == "delivered"
+    assert result.error_kind == "partial_media"
+    assert "synthetic error" in result.error
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_notifies_user_when_every_image_fails() -> None:
+    from plugins.max.adapter import SendResult
+
+    class _Client:
+        def __init__(self) -> None:
+            self.sent = []
+
+        async def send_message(self, chat_id, text, **kwargs):
+            self.sent.append((chat_id, text, kwargs))
+            return {"message": {"body": {"mid": "notice-mid"}}}
+
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    adapter._client = _Client()
+    adapter._chat_target_types = {"user-1": "user"}
+    adapter._rate_limiter = max_adapter_module.MaxRateLimiter()
+
+    async def fail_send_image(*args, **kwargs):
+        return SendResult(success=False, error="upload failed")
+
+    adapter.send_image = fail_send_image
+    result = await adapter.send_multiple_images(
+        "user-1", [("https://img.example/a.png", ""), ("https://img.example/b.png", "")]
+    )
+
+    assert result.success is False
+    assert adapter._client.sent[0][1] == "Не удалось доставить изображения №1, №2."
+
+
+@pytest.mark.asyncio
+async def test_local_media_caption_is_split_without_truncation(tmp_path) -> None:
+    media_path = tmp_path / "image.png"
+    media_path.write_bytes(b"image")
+
+    class _Client:
+        def __init__(self):
+            self.sent = []
+
+        async def upload_media(self, path, **kwargs):
+            return {"token": "image-token"}
+
+        async def send_message(self, target_id, text, **kwargs):
+            self.sent.append(text)
+            return {"message": {"body": {"mid": f"mid-{len(self.sent)}"}}}
+
+    adapter = object.__new__(max_adapter_module.MaxAdapter)
+    adapter._client = _Client()
+    adapter._chat_target_types = {"user-1": "user"}
+    adapter._media_max_bytes = 1024
+    adapter._rate_limiter = max_adapter_module.MaxRateLimiter()
+    adapter.validate_media_delivery_path = lambda path: str(path)
+    caption = "я" * 4501
+
+    result = await adapter.send_image_file("user-1", str(media_path), caption=caption)
+
+    assert result.success is True
+    assert adapter._client.sent == ["я" * 4000, "я" * 501]
+    assert result.message_id == "mid-2"
+    assert result.continuation_message_ids == ("mid-1",)
 
 
 @pytest.mark.asyncio

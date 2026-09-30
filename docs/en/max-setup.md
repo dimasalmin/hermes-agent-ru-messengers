@@ -34,8 +34,8 @@ MAX_ALLOWED_USERS=123456789
 MAX_GROUP_ALLOWED_USERS=123456789
 MAX_GROUP_ALLOWED_CHATS=123456789
 MAX_ADMIN_USERS=123456789
-# Optional: per-attachment limit; default is 50 MiB.
-MAX_MEDIA_MAX_BYTES=52428800
+# Optional: per-attachment limit; default and hard cap are 50,000,000 bytes.
+MAX_MEDIA_MAX_BYTES=50000000
 ```
 
 With no Webhook URL, the adapter uses Long Polling for development and smoke

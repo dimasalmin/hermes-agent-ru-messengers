@@ -10,8 +10,10 @@ and never writes to Hermes home, config, services, or the running gateway.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib.util
 import inspect
+import logging
 import sys
 import types
 from pathlib import Path
@@ -68,6 +70,7 @@ def main() -> int:
     # any adapter factory is instantiated. Mirror that small lifecycle step so
     # Platform("max") exercises the same dynamic-enum path as gateway startup.
     from gateway.platform_registry import PlatformEntry, platform_registry
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
 
     platform_registry.register(PlatformEntry(**entry))
     signature = inspect.signature(module.MaxAdapter.connect)
@@ -76,13 +79,64 @@ def main() -> int:
     try:
         from gateway.config import PlatformConfig
 
-        module.MaxAdapter(PlatformConfig(enabled=True, token="loader-smoke-token"))
+        adapter = module.MaxAdapter(PlatformConfig(enabled=True, token="loader-smoke-token"))
     except Exception as exc:  # noqa: BLE001 - report the contract failure clearly
         raise SystemExit(f"MaxAdapter cannot instantiate against Hermes: {exc}") from exc
+
+    if not isinstance(adapter, BasePlatformAdapter):
+        raise SystemExit("MaxAdapter does not inherit Hermes BasePlatformAdapter")
+    for hook in ("on_processing_start", "on_processing_complete"):
+        method = getattr(adapter, hook, None)
+        if not callable(method) or not inspect.iscoroutinefunction(method):
+            raise SystemExit(f"MAX adapter is missing Hermes processing hook {hook}")
+    for method in (
+        "send_image", "send_image_file", "send_document", "send_voice",
+        "send_video", "send_animation", "send_multiple_images",
+    ):
+        if not callable(getattr(adapter, method, None)):
+            raise SystemExit(f"MAX adapter is missing Hermes media method {method}")
+
+    async def verify_send_result_contract() -> None:
+        results = [
+            SendResult(success=True, message_id="first"),
+            SendResult(success=False, error="synthetic failure"),
+            SendResult(success=True, message_id="last"),
+        ]
+
+        async def fake_send_image(chat_id, image_url, **kwargs):
+            del chat_id, image_url, kwargs
+            return results.pop(0)
+
+        adapter.send_image = fake_send_image
+        result = await adapter.send_multiple_images(
+            "test-chat",
+            [("https://example.invalid/1.png", ""),
+             ("https://example.invalid/2.png", ""),
+             ("https://example.invalid/3.png", "")],
+        )
+        if not isinstance(result, SendResult):
+            raise RuntimeError("send_multiple_images did not return Hermes SendResult")
+        if not result.success or result.message_id != "last":
+            raise RuntimeError("send_multiple_images returned an invalid partial-success result")
+        if tuple(result.continuation_message_ids) != ("first",):
+            raise RuntimeError("send_multiple_images lost continuation message IDs")
+        if not result.error or result.error_kind != "partial_media":
+            raise RuntimeError("send_multiple_images hid a partial image-delivery failure")
+
+    previous_log_disable = logging.root.manager.disable
+    try:
+        logging.disable(logging.WARNING)
+        asyncio.run(verify_send_result_contract())
+    except Exception as exc:  # noqa: BLE001 - report the contract failure clearly
+        raise SystemExit(f"MAX native media contract failed: {exc}") from exc
+    finally:
+        logging.disable(previous_log_disable)
 
     print(f"plugin_import=ok module={name}")
     print(f"platform_name={entry['name']}")
     print("adapter_instantiation=ok")
+    print("native_send_result_contract=ok")
+    print("native_processing_hooks=ok")
     print(f"hooks={','.join(sorted(required))}")
     print("writes_hermes_core=no")
     return 0
